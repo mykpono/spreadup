@@ -73,7 +73,15 @@ async function init() {
 // ─── Background messaging ─────────────────────────────────────────────────────
 function bg(type, payload) {
   return new Promise((resolve) => {
-    chrome.runtime.sendMessage({ type, payload }, resolve);
+    try {
+      chrome.runtime.sendMessage({ type, payload }, resolve);
+    } catch (err) {
+      // "Extension context invalidated" — extension was reloaded, page needs refresh
+      if (err.message?.includes('invalidated')) {
+        showToast('Extension updated — please refresh the LinkedIn page');
+      }
+      resolve({ error: err.message });
+    }
   });
 }
 
