@@ -1,0 +1,68 @@
+{
+  "manifest_version": 3,
+  "name": "SpreadUp",
+  "version": "1.0.0",
+  "description": "Write great LinkedIn posts fast. Free for 50 posts, then $20 one-time.",
+
+  "permissions": [
+    "identity",
+    "storage",
+    "activeTab",
+    "clipboardWrite"
+  ],
+
+  "host_permissions": [
+    "https://www.linkedin.com/*",
+    "https://*.firebaseio.com/*",
+    "https://*.googleapis.com/*",
+    "https://identitytoolkit.googleapis.com/*",
+    "https://api.anthropic.com/*"
+  ],
+
+  "oauth2": {
+    "client_id": "144036848601-j9mekp4v7j8h3m6p2d3ph3v54gattpe3.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/userinfo.email",
+      "https://www.googleapis.com/auth/userinfo.profile"
+    ]
+  },
+
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+
+  "content_scripts": [
+    {
+      "matches": ["https://www.linkedin.com/*"],
+      "js": ["src/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+
+  "web_accessible_resources": [
+    {
+      "resources": ["panel/panel.html", "panel/panel.css", "icons/*"],
+      "matches": ["https://www.linkedin.com/*"]
+    }
+  ],
+
+  "action": {
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    },
+    "default_title": "SpreadUp"
+  },
+
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
+}

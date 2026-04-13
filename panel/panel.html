@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SpreadUp</title>
+  <link rel="stylesheet" href="panel.css" />
+</head>
+<body>
+
+<!-- ─── Auth screen (shown before sign-in) ──────────────────────────────── -->
+<div id="auth-screen" class="screen">
+  <div class="auth-card">
+    <div class="logo-mark">
+      <svg width="40" height="40" viewBox="0 0 24 24" fill="none">
+        <path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z"
+              fill="#F59E0B" stroke="#F59E0B" stroke-width="1"/>
+      </svg>
+    </div>
+    <h1 class="auth-title">SpreadUp</h1>
+    <p class="auth-sub">Write great LinkedIn posts, fast.<br/>Free for 50 posts, then $20 once.</p>
+    <button id="btn-signin" class="btn-google">
+      <svg width="18" height="18" viewBox="0 0 18 18">
+        <path fill="#4285F4" d="M17.64 9.2c0-.637-.057-1.251-.164-1.84H9v3.481h4.844c-.209 1.125-.843 2.078-1.796 2.717v2.258h2.908c1.702-1.567 2.684-3.875 2.684-6.615z"/>
+        <path fill="#34A853" d="M9 18c2.43 0 4.467-.806 5.956-2.18l-2.908-2.259c-.806.54-1.837.86-3.048.86-2.344 0-4.328-1.584-5.036-3.711H.957v2.332C2.438 15.983 5.482 18 9 18z"/>
+        <path fill="#FBBC05" d="M3.964 10.71c-.18-.54-.282-1.117-.282-1.71s.102-1.17.282-1.71V4.958H.957C.347 6.173 0 7.548 0 9s.347 2.827.957 4.042l3.007-2.332z"/>
+        <path fill="#EA4335" d="M9 3.58c1.321 0 2.508.454 3.44 1.345l2.582-2.58C13.463.891 11.426 0 9 0 5.482 0 2.438 2.017.957 4.958L3.964 6.29C4.672 4.163 6.656 3.58 9 3.58z"/>
+      </svg>
+      Continue with Google
+    </button>
+    <p class="auth-fine">By signing in you agree to our <a href="#" target="_blank">Terms</a>.</p>
+  </div>
+</div>
+
+<!-- ─── Main app (shown after sign-in) ──────────────────────────────────── -->
+<div id="app-screen" class="screen hidden">
+  <div class="layout">
+
+    <!-- Left sidebar -->
+    <nav class="sidebar">
+      <div class="sidebar-logo">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
+          <path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z"
+                fill="#F59E0B" stroke="#F59E0B" stroke-width="1"/>
+        </svg>
+      </div>
+
+      <div class="sidebar-nav">
+        <button class="nav-btn active" data-tab="editor" title="Editor">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/>
+            <path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/>
+          </svg>
+        </button>
+        <button class="nav-btn" data-tab="hooks" title="Hooks">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+          </svg>
+        </button>
+        <button class="nav-btn" data-tab="ctas" title="CTAs & Endings">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="10"/>
+            <polyline points="12 8 16 12 12 16"/>
+            <line x1="8" y1="12" x2="16" y2="12"/>
+          </svg>
+        </button>
+        <button class="nav-btn" data-tab="drafts" title="Drafts">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <line x1="16" y1="13" x2="8" y2="13"/>
+            <line x1="16" y1="17" x2="8" y2="17"/>
+            <polyline points="10 9 9 9 8 9"/>
+          </svg>
+        </button>
+        <button class="nav-btn" data-tab="snippets" title="Snippets">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="9" y="9" width="13" height="13" rx="2"/>
+            <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="sidebar-bottom">
+        <button class="nav-btn" data-tab="settings" title="Settings">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
+          </svg>
+        </button>
+        <button class="nav-btn" id="btn-close" title="Close">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="6" x2="6" y2="18"/>
+            <line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+    </nav>
+
+    <!-- Main content area -->
+    <main class="main">
+
+      <!-- ── Editor tab ── -->
+      <div id="tab-editor" class="tab-panel active">
+        <div class="tab-header">
+          <h2>Editor</h2>
+          <div class="header-meta" id="post-counter-badge">
+            <span class="badge badge-free" id="posts-remaining-label">50 posts free</span>
+          </div>
+        </div>
+
+        <!-- Formatting toolbar -->
+        <div class="toolbar">
+          <button class="tool-btn" data-fmt="bold" title="Bold (Ctrl+B)"><b>B</b></button>
+          <button class="tool-btn" data-fmt="italic" title="Italic (Ctrl+I)"><i>I</i></button>
+          <button class="tool-btn" data-fmt="strike" title="Strikethrough"><s>S</s></button>
+          <div class="toolbar-sep"></div>
+          <button class="tool-btn" data-fmt="bullet" title="Bullet list">•—</button>
+          <button class="tool-btn" data-fmt="numbered" title="Numbered list">1.</button>
+          <div class="toolbar-sep"></div>
+          <select id="bullet-style" class="tool-select" title="Bullet style">
+            <option value="•">•</option>
+            <option value="▸">▸</option>
+            <option value="✦">✦</option>
+            <option value="◆">◆</option>
+            <option value="✅">✅</option>
+          </select>
+          <div class="toolbar-sep"></div>
+          <button class="tool-btn" data-fmt="divider" title="Section divider">—</button>
+          <button class="tool-btn emoji-btn" id="emoji-toggle" title="Emoji">😊</button>
+          <div class="toolbar-sep"></div>
+          <button class="tool-btn format-btn" id="btn-smart-format" title="Auto-format: detect paragraphs, bullets, bold">✨ Format</button>
+        </div>
+
+        <!-- Emoji picker (hidden by default) -->
+        <div id="emoji-picker" class="emoji-picker hidden">
+          <input type="text" id="emoji-search" placeholder="Search emoji…" class="emoji-search" />
+          <div id="emoji-grid" class="emoji-grid"></div>
+        </div>
+
+        <!-- @ mention picker -->
+        <div id="mention-dropdown" class="mention-dropdown hidden">
+          <div class="mention-header">
+            <span class="mention-label">Tag a person or company</span>
+            <button id="mention-close" class="mention-close">✕</button>
+          </div>
+          <input type="text" id="mention-query" class="mention-query" placeholder="Type a name…" autocomplete="off" />
+          <div id="mention-list" class="mention-list">
+            <div class="mention-tip">Type a name and press <kbd>Enter</kbd> to insert the @mention.</div>
+          </div>
+        </div>
+
+        <!-- Text area -->
+        <textarea id="editor-area" class="editor-area"
+          placeholder="Start writing your post…&#10;&#10;Tip: Type @ to mention someone. Click ✨ Format to auto-format pasted text."
+          spellcheck="true"
+          maxlength="3000"
+        ></textarea>
+
+        <!-- Stats bar -->
+        <div class="stats-bar">
+          <span id="char-count">0 / 3000</span>
+          <span id="word-count">0 words</span>
+          <span id="read-time">~0 min read</span>
+          <span id="fk-score" class="fk-badge fk-green">Grade —</span>
+        </div>
+
+        <!-- Preview toggle -->
+        <div class="preview-toggle-row">
+          <button class="toggle-chip active" id="view-desktop" data-view="desktop">Desktop</button>
+          <button class="toggle-chip" id="view-mobile" data-view="mobile">Mobile</button>
+        </div>
+
+        <!-- Live preview -->
+        <div class="preview-pane" id="preview-pane">
+          <div class="preview-post">
+            <img id="preview-avatar-img" class="preview-avatar" style="object-fit:cover;display:none" />
+            <div class="preview-avatar" id="preview-avatar-fallback"></div>
+            <div style="flex:1;min-width:0">
+              <div class="preview-meta">
+                <strong id="preview-name">Your Name</strong>
+                <span id="preview-headline">• Your headline</span>
+              </div>
+              <div class="preview-body" id="preview-body">
+                Your post preview will appear here as you type…
+              </div>
+              <div class="preview-see-more hidden" id="see-more-hint">… <a href="#">see more</a></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Actions -->
+        <div class="action-row">
+          <button class="btn-secondary" id="btn-save-draft">Save draft</button>
+          <button class="btn-primary" id="btn-publish">Publish</button>
+        </div>
+        <div id="toast" class="toast"></div>
+
+        <!-- ── LinkedIn-style publish preview overlay ── -->
+        <div id="publish-preview" class="publish-overlay hidden">
+          <div class="publish-overlay-inner">
+            <div class="pp-header">
+              <span class="pp-title">Preview your post</span>
+              <button id="pp-close" class="pp-close-btn">✕</button>
+            </div>
+            <div class="pp-card">
+              <div class="pp-card-header">
+                <div class="pp-avatar-wrap">
+                  <img id="pp-avatar-img" class="pp-avatar" style="display:none;object-fit:cover" />
+                  <div id="pp-avatar-fallback" class="pp-avatar pp-avatar-fallback"></div>
+                </div>
+                <div class="pp-meta">
+                  <div class="pp-name" id="pp-name">Your Name</div>
+                  <div class="pp-headline" id="pp-headline">Your headline</div>
+                  <div class="pp-time">Now &nbsp;·&nbsp; 🌐</div>
+                </div>
+              </div>
+              <div class="pp-body" id="pp-body"></div>
+              <div class="pp-reactions">
+                <button class="pp-react-btn">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#666" stroke-width="2"><path d="M14 9V5a3 3 0 00-3-3l-4 9v11h11.28a2 2 0 002-1.7l1.38-9a2 2 0 00-2-2.3H14z"/><path d="M7 22H4a2 2 0 01-2-2v-7a2 2 0 012-2h3"/></svg>
+                  Like
+                </button>
+                <button class="pp-react-btn">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#666" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
+                  Comment
+                </button>
+                <button class="pp-react-btn">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#666" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 014-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 01-4 4H3"/></svg>
+                  Repost
+                </button>
+                <button class="pp-react-btn">
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#666" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                  Send
+                </button>
+              </div>
+            </div>
+            <div class="pp-footer">
+              <button class="btn-secondary" id="pp-edit">← Edit</button>
+              <button class="btn-primary" id="pp-confirm">Publish</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ── Hooks tab ── -->
+      <div id="tab-hooks" class="tab-panel hidden">
+        <div class="tab-header">
+          <h2>Hooks</h2>
+          <input type="text" id="hook-search" placeholder="Search hooks…" class="search-input" />
+        </div>
+        <div class="category-chips" id="hook-categories"></div>
+        <div class="library-list" id="hooks-list"></div>
+      </div>
+
+      <!-- ── CTAs tab ── -->
+      <div id="tab-ctas" class="tab-panel hidden">
+        <div class="tab-header">
+          <h2>CTAs & Endings</h2>
+          <input type="text" id="cta-search" placeholder="Search endings…" class="search-input" />
+        </div>
+        <div class="category-chips" id="cta-categories"></div>
+        <div class="library-list" id="ctas-list"></div>
+      </div>
+
+      <!-- ── Drafts tab ── -->
+      <div id="tab-drafts" class="tab-panel hidden">
+        <div class="tab-header">
+          <h2>Drafts</h2>
+        </div>
+        <div id="drafts-list" class="library-list"></div>
+        <div id="drafts-empty" class="empty-state hidden">
+          <p>No drafts yet. Save a post to see it here.</p>
+        </div>
+      </div>
+
+      <!-- ── Snippets tab ── -->
+      <div id="tab-snippets" class="tab-panel hidden">
+        <div class="tab-header">
+          <h2>Snippets</h2>
+          <button class="btn-icon" id="btn-new-snippet" title="New snippet">+</button>
+        </div>
+        <div id="snippets-list" class="library-list"></div>
+        <form id="snippet-form" class="snippet-form hidden">
+          <input type="text" id="snippet-name" placeholder="Snippet name…" class="input-field" />
+          <textarea id="snippet-body" placeholder="Snippet content…" class="input-field" rows="3"></textarea>
+          <div class="form-actions">
+            <button type="button" class="btn-secondary" id="btn-cancel-snippet">Cancel</button>
+            <button type="submit" class="btn-primary">Save</button>
+          </div>
+        </form>
+      </div>
+
+      <!-- ── Settings tab ── -->
+      <div id="tab-settings" class="tab-panel hidden">
+        <div class="tab-header"><h2>Settings</h2></div>
+        <div class="settings-card">
+          <div class="settings-row">
+            <div>
+              <div class="settings-label" id="settings-name">—</div>
+              <div class="settings-sub" id="settings-email">—</div>
+            </div>
+            <button class="btn-secondary btn-sm" id="btn-signout">Sign out</button>
+          </div>
+        </div>
+        <div class="settings-card">
+          <div class="settings-section-title">License</div>
+          <div class="settings-row" id="license-row">
+            <span class="badge badge-free" id="license-badge">Free plan</span>
+            <button class="btn-primary btn-sm" id="btn-upgrade">Upgrade — $20</button>
+          </div>
+          <div class="progress-wrap">
+            <div class="progress-bar" id="progress-bar"></div>
+          </div>
+          <div class="settings-sub" id="license-sub">0 of 50 free posts used</div>
+        </div>
+        <div class="settings-card">
+          <div class="settings-section-title">AI Formatting</div>
+          <div class="settings-sub" style="margin-bottom:10px">Paste your Anthropic API key to enable AI-powered ✨ Format. Your key is stored locally and never sent anywhere except Anthropic.</div>
+          <div style="display:flex;gap:8px;align-items:center">
+            <input type="password" id="anthropic-key-input" class="input-field" placeholder="sk-ant-api03-…" style="flex:1;resize:none" />
+            <button class="btn-primary btn-sm" id="btn-save-anthropic-key">Save</button>
+          </div>
+          <div id="anthropic-key-status" class="settings-sub" style="margin-top:6px"></div>
+        </div>
+        <div class="settings-card">
+          <div class="settings-section-title">Data</div>
+          <div class="settings-row">
+            <span class="settings-label">Export drafts</span>
+            <button class="btn-secondary btn-sm" id="btn-export-drafts">Export JSON</button>
+          </div>
+        </div>
+      </div>
+
+    </main>
+  </div>
+
+  <!-- Paywall overlay -->
+  <div id="paywall-overlay" class="overlay hidden">
+    <div class="overlay-card">
+      <div class="overlay-icon">⭐</div>
+      <h2>You've used your 50 free posts</h2>
+      <p>Unlock unlimited posts with a one-time payment. No subscription, ever.</p>
+      <button class="btn-primary btn-full" id="btn-paywall-upgrade">Upgrade for $20 →</button>
+      <button class="btn-ghost" id="btn-paywall-close">Maybe later</button>
+    </div>
+  </div>
+
+</div><!-- /#app-screen -->
+
+<script src="panel.js"></script>
+</body>
+</html>
