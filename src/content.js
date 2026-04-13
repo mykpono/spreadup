@@ -204,7 +204,18 @@
 
   // ─── Publish flow ───────────────────────────────────────────────────────────
 
-  async function handlePublish(text) {
+  // ─── Helpers: data URL → File ─────────────────────────────────────────────
+
+  function dataUrlToFile(dataUrl, filename) {
+    const [header, base64] = dataUrl.split(',');
+    const mime = header.match(/:(.*?);/)?.[1] || 'application/octet-stream';
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new File([bytes], filename, { type: mime });
+  }
+
+  async function handlePublish(text, attachments = []) {
     // Hide SpreadUp panel so user can see the LinkedIn composer
     hidePanel();
 
@@ -235,6 +246,12 @@
 
     // Step 4: Insert text into the Quill editor
     insertTextIntoEditor(editor, text);
+
+    // Step 4b: Upload attachments if any
+    if (attachments.length) {
+      await delay(400);
+      await uploadAttachments(attachments);
+    }
 
     // Step 5: Wait for LinkedIn to process the text and enable the Post button
     await delay(800);
@@ -269,6 +286,120 @@
     panelFrame?.contentWindow?.postMessage({ type: 'PUBLISH_SUCCESS' }, '*');
   }
 
+  // ─── Upload attachments into LinkedIn composer ────────────────────────────────
+
+  async function uploadAttachments(attachments) {
+    const hasImages = attachments.some((a) => a.type === 'image');
+    const hasDoc    = attachments.some((a) => a.type === 'doc');
+
+    // Click the appropriate media button in LinkedIn's composer toolbar
+    // LinkedIn has toolbar buttons for photos and documents
+    if (hasImages) {
+      // Find the photo/image upload button (usually has an aria-label or icon)
+      const imgBtn = shadowFindByText('button', 'Add a photo')
+        || shadowQueryAll('button[aria-label*="photo"], button[aria-label*="image"], button[aria-label*="media"]')[0];
+      if (imgBtn) {
+        imgBtn.click();
+        await delay(500);
+      }
+    } else if (hasDoc) {
+      const docBtn = shadowFindByText('button', 'Add a document')
+        || shadowQueryAll('button[aria-label*="document"]')[0];
+      if (docBtn) {
+        docBtn.click();
+        await delay(500);
+      }
+    }
+
+    // Find the file input that LinkedIn creates
+    const fileInput = await pollFor(() => {
+      return shadowQuery('input[type="file"]')
+        || document.querySelector('input[type="file"]');
+    }, 3000);
+
+    if (!fileInput) {
+      console.warn('[SpreadUp] Could not find file input for attachment upload');
+      return;
+    }
+
+    // Convert data URLs to File objects and inject into the file input
+    const files = attachments.map((a) => dataUrlToFile(a.dataUrl, a.name));
+
+    // Use DataTransfer to create a FileList
+    const dt = new DataTransfer();
+    files.forEach((f) => dt.items.add(f));
+    fileInput.files = dt.files;
+
+    // Dispatch change event to trigger LinkedIn's upload handler
+    fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+
+    // Wait for upload to process
+    await delay(2000);
+  }
+
+  // ─── LinkedIn typeahead search ─────────────────────────────────────────────
+
+  async function searchLinkedInTypeahead(query) {
+    const results = [];
+    try {
+      // LinkedIn's Voyager typeahead API (works because content script runs on linkedin.com)
+      const csrfToken = document.cookie.match(/JSESSIONID="?([^";]+)/)?.[1] || '';
+      const resp = await fetch(
+        `https://www.linkedin.com/voyager/api/typeahead/hitsV2?keywords=${encodeURIComponent(query)}&origin=GLOBAL_SEARCH_HEADER&q=blended&types=List(PEOPLE,COMPANY)`,
+        {
+          headers: {
+            'csrf-token': csrfToken,
+            'x-restli-protocol-version': '2.0.0',
+          },
+          credentials: 'include',
+        }
+      );
+
+      if (resp.ok) {
+        const data = await resp.json();
+        const hits = data?.data?.elements || data?.elements || [];
+        for (const hit of hits.slice(0, 8)) {
+          const target = hit.hitInfo?.actorInsight?.actor || hit.hitInfo?.result || hit;
+          const name = target?.title?.text
+            || target?.name?.text
+            || hit.text?.text
+            || hit.title?.text;
+          const title = target?.subtext?.text
+            || target?.headline?.text
+            || hit.subtext?.text
+            || '';
+          const avatar = target?.image?.attributes?.[0]?.detailData?.nonEntityProfilePicture?.vectorImage?.rootUrl || '';
+          if (name) {
+            results.push({ name, title, avatar });
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('[SpreadUp] LinkedIn typeahead error:', err);
+    }
+
+    // If API fails or returns nothing, fall back to scraping visible names on page
+    if (!results.length) {
+      const nameEls = shadowQueryAll('span.t-bold, span[dir="ltr"] > span');
+      const seen = new Set();
+      for (const el of nameEls) {
+        const name = el.textContent?.trim();
+        if (name && name.length > 2 && name.length < 50
+            && !seen.has(name)
+            && name.toLowerCase().includes(query.toLowerCase())) {
+          seen.add(name);
+          results.push({ name, title: '', avatar: '' });
+          if (results.length >= 6) break;
+        }
+      }
+    }
+
+    panelFrame?.contentWindow?.postMessage({
+      type: 'LINKEDIN_SEARCH_RESULTS',
+      results,
+    }, '*');
+  }
+
   // ─── Message handler (from panel iframe) ─────────────────────────────────────
 
   function handlePanelMessage(event) {
@@ -296,7 +427,10 @@
         break;
       }
       case 'PUBLISH_POST':
-        handlePublish(payload.text);
+        handlePublish(payload.text, payload.attachments || []);
+        break;
+      case 'SEARCH_LINKEDIN':
+        searchLinkedInTypeahead(payload.query);
         break;
       default:
         break;

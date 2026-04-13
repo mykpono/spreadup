@@ -220,6 +220,36 @@ FORMATTING RULES:
   return { text: data.content[0]?.text || '' };
 }
 
+// ─── Open Graph metadata fetch ───────────────────────────────────────────────
+
+async function fetchOgMeta(url) {
+  try {
+    const res = await fetch(url, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (compatible; SpreadUp/1.0)' },
+      redirect: 'follow',
+    });
+    if (!res.ok) return { error: `HTTP ${res.status}` };
+
+    const html = await res.text();
+    const get = (prop) => {
+      const m = html.match(new RegExp(`<meta[^>]*property=["']og:${prop}["'][^>]*content=["']([^"']+)["']`, 'i'))
+        || html.match(new RegExp(`<meta[^>]*content=["']([^"']+)["'][^>]*property=["']og:${prop}["']`, 'i'));
+      return m?.[1] || '';
+    };
+
+    const title = get('title')
+      || (html.match(/<title[^>]*>([^<]+)<\/title>/i)?.[1] || '').trim();
+    const description = get('description')
+      || (html.match(/<meta[^>]*name=["']description["'][^>]*content=["']([^"']+)["']/i)?.[1] || '');
+    const image = get('image');
+    const domain = new URL(url).hostname.replace(/^www\./, '');
+
+    return { url, title, description, image, domain };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
 // ─── Message router (content script ↔ background) ────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -231,6 +261,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       case 'GET_USER_DATA': return getUserData();
       case 'INCREMENT_POST_COUNT': return incrementPostCount();
       case 'SMART_FORMAT':  return smartFormatWithAI(msg.payload?.text || '');
+      case 'FETCH_OG':      return fetchOgMeta(msg.payload?.url || '');
       default: return { error: 'Unknown message type' };
     }
   };

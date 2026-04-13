@@ -129,8 +129,19 @@
           <button class="tool-btn" data-fmt="divider" title="Section divider">—</button>
           <button class="tool-btn emoji-btn" id="emoji-toggle" title="Emoji">😊</button>
           <div class="toolbar-sep"></div>
+          <button class="tool-btn" id="btn-attach-image" title="Attach image">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
+          </button>
+          <button class="tool-btn" id="btn-attach-doc" title="Attach document (PDF)">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          </button>
+          <div class="toolbar-sep"></div>
           <button class="tool-btn format-btn" id="btn-smart-format" title="Auto-format: detect paragraphs, bullets, bold">✨ Format</button>
         </div>
+
+        <!-- Hidden file inputs -->
+        <input type="file" id="file-input-image" accept="image/jpeg,image/png,image/gif,image/webp" multiple hidden />
+        <input type="file" id="file-input-doc" accept="application/pdf" hidden />
 
         <!-- Emoji picker (hidden by default) -->
         <div id="emoji-picker" class="emoji-picker hidden">
@@ -138,15 +149,10 @@
           <div id="emoji-grid" class="emoji-grid"></div>
         </div>
 
-        <!-- @ mention picker -->
+        <!-- @ mention dropdown (inline, no separate input) -->
         <div id="mention-dropdown" class="mention-dropdown hidden">
-          <div class="mention-header">
-            <span class="mention-label">Tag a person or company</span>
-            <button id="mention-close" class="mention-close">✕</button>
-          </div>
-          <input type="text" id="mention-query" class="mention-query" placeholder="Type a name…" autocomplete="off" />
           <div id="mention-list" class="mention-list">
-            <div class="mention-tip">Type a name and press <kbd>Enter</kbd> to insert the @mention.</div>
+            <div class="mention-tip">Keep typing a name to search…</div>
           </div>
         </div>
 
@@ -156,6 +162,9 @@
           spellcheck="true"
           maxlength="3000"
         ></textarea>
+
+        <!-- Attachment preview strip -->
+        <div id="attachments-strip" class="attachments-strip hidden"></div>
 
         <!-- Stats bar -->
         <div class="stats-bar">
@@ -185,6 +194,10 @@
                 Your post preview will appear here as you type…
               </div>
               <div class="preview-see-more hidden" id="see-more-hint">… <a href="#">see more</a></div>
+              <!-- Attachment preview in live preview -->
+              <div id="preview-attachments" class="preview-attachments hidden"></div>
+              <!-- URL link preview card -->
+              <div id="preview-link-card" class="link-card hidden"></div>
             </div>
           </div>
         </div>
@@ -216,6 +229,8 @@
                 </div>
               </div>
               <div class="pp-body" id="pp-body"></div>
+              <div id="pp-attachments" class="preview-attachments hidden"></div>
+              <div id="pp-link-card" class="link-card hidden"></div>
               <div class="pp-reactions">
                 <button class="pp-react-btn">
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#666" stroke-width="2"><path d="M14 9V5a3 3 0 00-3-3l-4 9v11h11.28a2 2 0 002-1.7l1.38-9a2 2 0 00-2-2.3H14z"/><path d="M7 22H4a2 2 0 01-2-2v-7a2 2 0 012-2h3"/></svg>

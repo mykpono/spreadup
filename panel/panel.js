@@ -14,6 +14,7 @@ let state = {
   editorText: '',
   drafts: [],
   snippets: [],
+  attachments: [],    // { id, type: 'image'|'doc', name, dataUrl, file }
   activeHookCat: 'all',
   activeCtaCat: 'all',
 };
@@ -163,6 +164,15 @@ function setupEditorEvents() {
     updateStats();
     updatePreview();
     autosaveDraft();
+  });
+
+  // Auto-format on paste: convert markdown + run smart format
+  editorArea.addEventListener('paste', () => {
+    // Let the pasted text land in the textarea first, then format
+    setTimeout(() => {
+      state.editorText = editorArea.value;
+      smartFormat();
+    }, 50);
   });
 }
 
@@ -561,7 +571,13 @@ function setupActions() {
     const btn = $('#pp-confirm');
     btn.textContent = 'Publishing…';
     btn.disabled = true;
-    window.parent.postMessage({ type: 'PUBLISH_POST', payload: { text: state.editorText } }, '*');
+    // Send attachments as data URLs (File objects can't cross postMessage to parent)
+    const attachments = state.attachments.map((a) => ({
+      type: a.type,
+      name: a.name,
+      dataUrl: a.dataUrl,
+    }));
+    window.parent.postMessage({ type: 'PUBLISH_POST', payload: { text: state.editorText, attachments } }, '*');
   });
 
   btnPaywallUpgrade.addEventListener('click', () => window.open(PAYMENT_URL, '_blank'));
@@ -696,11 +712,34 @@ async function loadLocalData() {
 
 // ─── Smart Format ─────────────────────────────────────────────────────────────
 // Pure heuristic — no AI API needed.
-// Pipeline: parse → detect structure → reformat → bold key phrases → assemble
+// Pipeline: markdown convert → parse → detect structure → reformat → bold key phrases → assemble
+
+function convertMarkdown(text) {
+  return text
+    // Bold: **text** or __text__
+    .replace(/\*\*(.+?)\*\*/g, (_, inner) => convertText(inner, 'bold'))
+    .replace(/__(.+?)__/g, (_, inner) => convertText(inner, 'bold'))
+    // Italic: *text* or _text_ (but not inside words like file_name)
+    .replace(/(?<!\w)\*([^*\n]+?)\*(?!\w)/g, (_, inner) => convertText(inner, 'italic'))
+    .replace(/(?<!\w)_([^_\n]+?)_(?!\w)/g, (_, inner) => convertText(inner, 'italic'))
+    // Headers: # Header → bold text (strip the #)
+    .replace(/^#{1,3}\s+(.+)$/gm, (_, inner) => convertText(inner, 'bold'))
+    // Unordered list markers: - item, * item → bullet
+    .replace(/^[-*]\s+/gm, '• ')
+    // Strikethrough: ~~text~~
+    .replace(/~~(.+?)~~/g, (_, inner) => [...inner].map((c) => c + '\u0336').join(''))
+    // Inline code: `code` → strip backticks
+    .replace(/`([^`]+)`/g, '$1')
+    // Code blocks: ```...``` → strip fences
+    .replace(/```[\s\S]*?```/g, (m) => m.replace(/^```\w*\n?/, '').replace(/\n?```$/, ''));
+}
 
 function smartFormat() {
-  const raw = editorArea.value.trim();
+  let raw = editorArea.value.trim();
   if (!raw) return;
+
+  // Convert any markdown formatting first
+  raw = convertMarkdown(raw);
 
   const bullet     = $('#bullet-style').value || '•';
   const BULLET_RE  = /^(->|=>|–|—|[-*•]|\d+[.):])\s*/;
@@ -899,109 +938,387 @@ async function setupAnthropicKey() {
   });
 }
 
-// ─── @ Mention system ────────────────────────────────────────────────────────
+// ─── @ Mention system (inline) ───────────────────────────────────────────────
+// Detects '@' typed in the editor textarea. As user types after '@', shows a
+// floating dropdown with LinkedIn search results. Selecting a result inserts
+// '@Name' at the cursor position. No separate input field needed.
 
-let mentionStartPos = -1; // caret position where '@' was typed
+let mentionActive   = false;
+let mentionAtPos    = -1;   // index of the '@' character in editorArea.value
+let mentionResults  = [];
+let mentionSelected = 0;    // highlighted index in dropdown
+let mentionSearchTimer = null;
 
-const mentionDropdown  = $('#mention-dropdown');
-const mentionQuery     = $('#mention-query');
-const mentionList      = $('#mention-list');
-const mentionCloseBtn  = $('#mention-close');
+const mentionDropdown = $('#mention-dropdown');
+const mentionList     = $('#mention-list');
 
-// Seed a small local contact list (user can add to this over time)
-// In future this could query LinkedIn's typeahead API
-const LOCAL_CONTACTS = [];
+function getMentionQuery() {
+  if (mentionAtPos < 0) return '';
+  return editorArea.value.slice(mentionAtPos + 1, editorArea.selectionStart);
+}
 
-function openMention(atPos) {
-  mentionStartPos = atPos;
-  mentionQuery.value = '';
-  renderMentionResults('');
+function openMention() {
+  mentionActive = true;
+  mentionAtPos = editorArea.selectionStart - 1; // position of '@'
+  mentionResults = [];
+  mentionSelected = 0;
+  positionMentionDropdown();
+  renderMentionList('');
   mentionDropdown.classList.remove('hidden');
-  mentionQuery.focus();
 }
 
 function closeMention() {
+  mentionActive = false;
+  mentionAtPos = -1;
+  mentionResults = [];
   mentionDropdown.classList.add('hidden');
-  mentionStartPos = -1;
-  editorArea.focus();
+  clearTimeout(mentionSearchTimer);
+}
+
+function positionMentionDropdown() {
+  // Position dropdown near the cursor in the textarea
+  const rect = editorArea.getBoundingClientRect();
+  // Estimate cursor Y from line count
+  const textBefore = editorArea.value.slice(0, editorArea.selectionStart);
+  const lineCount = textBefore.split('\n').length;
+  const lineHeight = 20; // approx
+  const cursorY = Math.min(lineCount * lineHeight, rect.height - 40);
+
+  mentionDropdown.style.position = 'absolute';
+  mentionDropdown.style.left = `${rect.left + 16}px`;
+  mentionDropdown.style.top = `${rect.top + cursorY + 24}px`;
+  mentionDropdown.style.width = `${Math.min(rect.width - 32, 320)}px`;
 }
 
 function insertMention(name) {
-  if (mentionStartPos < 0) return;
-  const before = editorArea.value.slice(0, mentionStartPos); // includes the '@'
+  if (mentionAtPos < 0) return;
+  const before = editorArea.value.slice(0, mentionAtPos);
   const after  = editorArea.value.slice(editorArea.selectionStart);
   const tag    = `@${name} `;
   editorArea.value = before + tag + after;
-  // Move caret after inserted mention
-  const newPos = mentionStartPos + tag.length;
+  const newPos = before.length + tag.length;
   editorArea.setSelectionRange(newPos, newPos);
   state.editorText = editorArea.value;
   updateStats(); updatePreview();
   closeMention();
+  editorArea.focus();
 }
 
-function renderMentionResults(query) {
-  const q = query.toLowerCase().trim();
-  const matches = q
-    ? LOCAL_CONTACTS.filter((c) =>
-        c.name.toLowerCase().includes(q) || (c.title || '').toLowerCase().includes(q)
-      )
-    : LOCAL_CONTACTS.slice(0, 8);
+function renderMentionList(query) {
+  const q = query.trim();
 
-  if (!matches.length) {
-    mentionList.innerHTML = q
-      ? `<div class="mention-item" id="mention-insert-new">
-           <div class="mention-item-avatar">${q[0]?.toUpperCase() || '@'}</div>
-           <div><div class="mention-item-name">@${query}</div>
-           <div class="mention-item-sub">Press Enter to insert</div></div>
-         </div>`
-      : `<div class="mention-tip">Type a name and press <kbd>Enter</kbd> to insert the @mention.</div>`;
-
-    if (q) {
-      $('#mention-insert-new')?.addEventListener('click', () => insertMention(query));
-    }
-    return;
+  if (mentionResults.length) {
+    mentionList.innerHTML = mentionResults.map((r, i) => `
+      <div class="mention-item${i === mentionSelected ? ' mention-selected' : ''}" data-idx="${i}">
+        <div class="mention-item-avatar">
+          ${r.avatar ? `<img src="${r.avatar}" style="width:100%;height:100%;border-radius:50%;"/>` : r.name[0].toUpperCase()}
+        </div>
+        <div>
+          <div class="mention-item-name">${r.name}</div>
+          ${r.title ? `<div class="mention-item-sub">${r.title}</div>` : ''}
+        </div>
+      </div>
+    `).join('');
+  } else if (q) {
+    mentionList.innerHTML = `
+      <div class="mention-item mention-selected" data-idx="-1">
+        <div class="mention-item-avatar">@</div>
+        <div>
+          <div class="mention-item-name">@${q}</div>
+          <div class="mention-item-sub">Press Enter or Tab to insert</div>
+        </div>
+      </div>
+      <div class="mention-tip">Searching LinkedIn…</div>`;
+  } else {
+    mentionList.innerHTML = `<div class="mention-tip">Keep typing a name to search…</div>`;
   }
 
-  mentionList.innerHTML = matches.map((c, idx) => `
-    <div class="mention-item" data-idx="${idx}">
-      <div class="mention-item-avatar">${c.name[0].toUpperCase()}</div>
-      <div>
-        <div class="mention-item-name">${c.name}</div>
-        ${c.title ? `<div class="mention-item-sub">${c.title}</div>` : ''}
-      </div>
-    </div>
-  `).join('');
-
-  $$('.mention-item', mentionList).forEach((el) => {
-    el.addEventListener('click', () => insertMention(matches[el.dataset.idx].name));
+  // Bind clicks
+  $$('.mention-item[data-idx]', mentionList).forEach((el) => {
+    el.addEventListener('click', () => {
+      const idx = parseInt(el.dataset.idx);
+      if (idx >= 0 && mentionResults[idx]) {
+        insertMention(mentionResults[idx].name);
+      } else {
+        insertMention(q);
+      }
+    });
   });
 }
 
-// Detect '@' typed in editor
-editorArea.addEventListener('keydown', (e) => {
-  if (e.key === '@') {
-    // Let the char land first, then open
-    setTimeout(() => openMention(editorArea.selectionStart - 1), 0);
+function searchLinkedIn(query) {
+  clearTimeout(mentionSearchTimer);
+  if (!query.trim() || query.length < 2) {
+    mentionResults = [];
+    renderMentionList(query);
+    return;
   }
-  if (e.key === 'Escape' && !mentionDropdown.classList.contains('hidden')) {
+  // Debounce: wait 300ms before searching
+  mentionSearchTimer = setTimeout(() => {
+    // Ask content script to search LinkedIn's typeahead
+    window.parent.postMessage({ type: 'SEARCH_LINKEDIN', payload: { query: query.trim() } }, '*');
+  }, 300);
+}
+
+// Handle @ key and inline typing
+editorArea.addEventListener('input', (e) => {
+  if (!mentionActive) return;
+
+  const query = getMentionQuery();
+
+  // Close if user deleted the '@' or moved cursor before it
+  if (editorArea.selectionStart <= mentionAtPos) {
     closeMention();
+    return;
   }
+
+  // Close on space (user finished typing and didn't select)
+  if (query.includes(' ') || query.includes('\n')) {
+    closeMention();
+    return;
+  }
+
+  searchLinkedIn(query);
+  renderMentionList(query);
 });
 
-// Typing in mention search input
-mentionQuery.addEventListener('input', () => renderMentionResults(mentionQuery.value));
+editorArea.addEventListener('keydown', (e) => {
+  // Detect '@' — open mention mode
+  if (e.key === '@' && !mentionActive) {
+    setTimeout(() => openMention(), 0);
+    return;
+  }
 
-mentionQuery.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') {
+  if (!mentionActive) return;
+
+  if (e.key === 'Escape') {
     e.preventDefault();
-    const q = mentionQuery.value.trim();
-    if (q) insertMention(q);
+    closeMention();
+    return;
   }
-  if (e.key === 'Escape') closeMention();
+
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    mentionSelected = Math.min(mentionSelected + 1, mentionResults.length - 1);
+    renderMentionList(getMentionQuery());
+    return;
+  }
+
+  if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    mentionSelected = Math.max(mentionSelected - 1, 0);
+    renderMentionList(getMentionQuery());
+    return;
+  }
+
+  if (e.key === 'Enter' || e.key === 'Tab') {
+    e.preventDefault();
+    if (mentionResults.length && mentionResults[mentionSelected]) {
+      insertMention(mentionResults[mentionSelected].name);
+    } else {
+      const q = getMentionQuery().trim();
+      if (q) insertMention(q);
+    }
+    return;
+  }
 });
 
-mentionCloseBtn.addEventListener('click', closeMention);
+// Listen for LinkedIn search results from content script
+window.addEventListener('message', (e) => {
+  if (e.source !== window.parent) return;
+  if (e.data?.type === 'LINKEDIN_SEARCH_RESULTS' && mentionActive) {
+    mentionResults = e.data.results || [];
+    mentionSelected = 0;
+    renderMentionList(getMentionQuery());
+  }
+});
+
+// ─── File / image attachments ────────────────────────────────────────────────
+
+const fileInputImage = $('#file-input-image');
+const fileInputDoc   = $('#file-input-doc');
+const attachStrip    = $('#attachments-strip');
+
+$('#btn-attach-image').addEventListener('click', () => fileInputImage.click());
+$('#btn-attach-doc').addEventListener('click', () => fileInputDoc.click());
+
+fileInputImage.addEventListener('change', () => handleFiles(fileInputImage.files, 'image'));
+fileInputDoc.addEventListener('change', () => handleFiles(fileInputDoc.files, 'doc'));
+
+function handleFiles(fileList, type) {
+  if (!fileList?.length) return;
+
+  // LinkedIn limits: up to 9 images, or 1 document
+  if (type === 'doc') {
+    // Replace any existing doc; images stay
+    state.attachments = state.attachments.filter((a) => a.type !== 'doc');
+  }
+
+  const maxImages = 9;
+  const currentImages = state.attachments.filter((a) => a.type === 'image').length;
+
+  for (const file of fileList) {
+    if (type === 'image' && currentImages + state.attachments.filter((a) => a.type === 'image').length >= maxImages) break;
+    if (file.size > 10 * 1024 * 1024) {
+      showToast('File too large (max 10 MB)');
+      continue;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      state.attachments.push({
+        id: Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+        type,
+        name: file.name,
+        dataUrl: reader.result,
+        file,
+      });
+      renderAttachments();
+      updatePreview();
+    };
+    reader.readAsDataURL(file);
+  }
+
+  // Reset so the same file can be re-selected
+  fileInputImage.value = '';
+  fileInputDoc.value = '';
+}
+
+function removeAttachment(id) {
+  state.attachments = state.attachments.filter((a) => a.id !== id);
+  renderAttachments();
+  updatePreview();
+}
+
+function renderAttachments() {
+  if (!state.attachments.length) {
+    attachStrip.classList.add('hidden');
+    attachStrip.innerHTML = '';
+    return;
+  }
+  attachStrip.classList.remove('hidden');
+  attachStrip.innerHTML = state.attachments.map((a) => {
+    if (a.type === 'image') {
+      return `<div class="attach-thumb" data-id="${a.id}">
+        <img src="${a.dataUrl}" alt="${a.name}" />
+        <button class="attach-remove" data-id="${a.id}">✕</button>
+      </div>`;
+    }
+    return `<div class="attach-thumb" data-id="${a.id}">
+      <div class="attach-thumb-doc">PDF</div>
+      <button class="attach-remove" data-id="${a.id}">✕</button>
+    </div>`;
+  }).join('');
+
+  $$('.attach-remove', attachStrip).forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      removeAttachment(btn.dataset.id);
+    });
+  });
+}
+
+// ─── URL link preview ──────────────────────────────────────────────────────��─
+
+const URL_RE = /https?:\/\/[^\s<>"']+/gi;
+let lastPreviewedUrl = '';
+let linkPreviewCache = {}; // url → { title, description, image, domain }
+
+function detectUrls(text) {
+  return (text.match(URL_RE) || []);
+}
+
+function renderLinkPreview(container, meta) {
+  if (!meta) {
+    container.classList.add('hidden');
+    container.innerHTML = '';
+    return;
+  }
+  container.classList.remove('hidden');
+  container.innerHTML = `
+    ${meta.image ? `<img class="link-card-image" src="${meta.image}" alt="" />` : ''}
+    <div class="link-card-body">
+      <div class="link-card-title">${meta.title || meta.url}</div>
+      ${meta.description ? `<div class="link-card-desc">${meta.description}</div>` : ''}
+      <div class="link-card-domain">${meta.domain || ''}</div>
+    </div>`;
+}
+
+function renderPreviewAttachments(container) {
+  if (!state.attachments.length) {
+    container.classList.add('hidden');
+    container.innerHTML = '';
+    return;
+  }
+  container.classList.remove('hidden');
+  container.innerHTML = state.attachments.map((a) => {
+    if (a.type === 'image') {
+      return `<img src="${a.dataUrl}" alt="${a.name}" />`;
+    }
+    return `<div class="preview-attach-doc">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#3B82F6" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+      ${a.name}
+    </div>`;
+  }).join('');
+}
+
+// Override updatePreview to include attachments + URL cards
+const _origUpdatePreview = updatePreview;
+updatePreview = function () {
+  const text = state.editorText;
+  const FOLD = 210;
+  if (text.length > FOLD) {
+    previewBody.textContent = text.slice(0, FOLD);
+    seeMoreHint.classList.remove('hidden');
+  } else {
+    previewBody.textContent = text || 'Your post preview will appear here as you type…';
+    seeMoreHint.classList.add('hidden');
+  }
+
+  // Attachments in preview
+  const previewAttach = $('#preview-attachments');
+  if (previewAttach) renderPreviewAttachments(previewAttach);
+
+  // URL link card in preview
+  const urls = detectUrls(text);
+  const previewLinkCard = $('#preview-link-card');
+  if (urls.length && urls[0] !== lastPreviewedUrl) {
+    lastPreviewedUrl = urls[0];
+    if (linkPreviewCache[urls[0]]) {
+      renderLinkPreview(previewLinkCard, linkPreviewCache[urls[0]]);
+    } else {
+      // Fetch OG metadata via background script
+      bg('FETCH_OG', { url: urls[0] }).then((meta) => {
+        if (meta && !meta.error) {
+          linkPreviewCache[urls[0]] = meta;
+          renderLinkPreview(previewLinkCard, meta);
+        }
+      });
+    }
+  } else if (!urls.length) {
+    lastPreviewedUrl = '';
+    if (previewLinkCard) renderLinkPreview(previewLinkCard, null);
+  }
+};
+
+// Update openPublishPreview to include attachments + URL card
+const _origOpenPublishPreview = openPublishPreview;
+openPublishPreview = function () {
+  _origOpenPublishPreview();
+
+  // Copy attachments into publish preview
+  const ppAttach = $('#pp-attachments');
+  if (ppAttach) renderPreviewAttachments(ppAttach);
+
+  // Copy URL card into publish preview
+  const urls = detectUrls(state.editorText);
+  const ppLinkCard = $('#pp-link-card');
+  if (urls.length && linkPreviewCache[urls[0]]) {
+    renderLinkPreview(ppLinkCard, linkPreviewCache[urls[0]]);
+  } else if (ppLinkCard) {
+    renderLinkPreview(ppLinkCard, null);
+  }
+};
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 init();
