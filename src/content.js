@@ -483,16 +483,16 @@
     await delay(2000);
   }
 
-  // ─── LinkedIn people search via Voyager API (fully background, no DOM touching) ─
-  // Calls LinkedIn's own typeahead endpoint — the same one powering its search bar.
-  // Because the content script runs on linkedin.com, fetch() automatically includes
-  // the session cookies, so no login handling is needed. The CSRF token lives in
-  // the JSESSIONID cookie (quotes stripped). Falls back to DOM scraping only if
-  // the API returns a non-2xx or the response is unparseable.
+  // ─── LinkedIn people search via Voyager API ──────────────────────────────────
+  // The CSRF token (from httpOnly JSESSIONID cookie) is supplied by the background
+  // service worker, which can read httpOnly cookies via chrome.cookies.get().
+  // The content script makes the actual fetch with credentials:include so the
+  // browser automatically attaches the session cookies — no DOM touching needed.
 
   let searchInProgress = false;
 
-  // ── Parse CSRF token LinkedIn stores in the JSESSIONID cookie ────────────────
+  // ── Parse CSRF from document.cookie (readable if not httpOnly) ───────────────
+  // Used as a fallback for publishViaApi. For search, the csrf comes from background.
   function getLinkedInCsrf() {
     return document.cookie
       .split(';')
@@ -502,9 +502,10 @@
       ?.replace(/^"|"$/g, '') || null;
   }
 
-  // ── Call the Voyager typeahead endpoint (returns null on any failure) ─────────
-  async function searchViaApi(query) {
-    const csrf = getLinkedInCsrf();
+  // ── Call the Voyager typeahead endpoint ───────────────────────────────────────
+  // csrfOverride: CSRF token from background (bypasses httpOnly restriction).
+  async function searchViaApi(query, csrfOverride) {
+    const csrf = csrfOverride || getLinkedInCsrf();
     if (!csrf) return null;
 
     const params = new URLSearchParams({
@@ -539,15 +540,11 @@
 
     return elements
       .map((el) => {
-        // The hit object is nested under a type-keyed property
-        const hit = el.hitInfo
-          ? Object.values(el.hitInfo)[0]
-          : el;
+        const hit = el.hitInfo ? Object.values(el.hitInfo)[0] : el;
 
-        const name   = hit?.text?.text   ?? hit?.name     ?? '';
-        const title  = hit?.subtext?.text ?? hit?.headline ?? '';
+        const name  = hit?.text?.text   ?? hit?.name     ?? '';
+        const title = hit?.subtext?.text ?? hit?.headline ?? '';
 
-        // Avatar: LinkedIn stores images as relative path segments
         const artifact =
           hit?.image?.attributes?.[0]?.detailData
             ?.['com.linkedin.voyager.dash.common.image.ImageViewModel']
@@ -567,87 +564,15 @@
       .filter((r) => r.name && r.name.length > 1 && r.name.length < 60);
   }
 
-  // ── Fallback: scrape LinkedIn's own search-bar dropdown (last resort) ─────────
-  async function searchViaDom(query) {
-    const input =
-      document.querySelector('input[placeholder*="looking for"]') ||
-      document.querySelector('input.search-global-typeahead__input') ||
-      shadowQuery('input[placeholder*="looking for"]') ||
-      shadowQuery('input[placeholder*="Search"]') ||
-      shadowQuery('input[role="combobox"]') ||
-      document.querySelector('input[role="combobox"]');
-
-    if (!input) return [];
-
-    // Hide the dropdown so it doesn't flash on screen
-    const hideStyle = document.createElement('style');
-    hideStyle.textContent = `
-      [role="listbox"], [role="combobox"] + *,
-      .search-global-typeahead__overlay { opacity:0!important; pointer-events:none!important; }
-    `;
-    document.head.appendChild(hideStyle);
-
-    try {
-      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-      setter.call(input, '');
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      await delay(80);
-
-      input.focus();
-      setter.call(input, query);
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-
-      let results = [];
-      const deadline = Date.now() + 2500;
-      while (Date.now() < deadline) {
-        await delay(250);
-        const options = [
-          ...document.querySelectorAll('[role="option"]'),
-          ...shadowQueryAll('[role="option"]'),
-        ];
-        const real = options.filter((o) => {
-          const t = o.textContent?.trim() || '';
-          return t.includes('•') && !t.includes('recent entity history');
-        });
-        if (real.length) {
-          results = real
-            .map((o) => {
-              const parts = (o.textContent?.trim() || '').split('•').map((s) => s.trim());
-              return {
-                name:   parts[0] || '',
-                title:  parts.slice(2).join(' · ').substring(0, 80) || parts[1] || '',
-                avatar: o.querySelector('img')?.src || '',
-              };
-            })
-            .filter((r) => r.name.length > 1 && r.name.length < 50 &&
-              !['see all results', 'show all'].includes(r.name.toLowerCase()));
-          break;
-        }
-      }
-
-      setter.call(input, '');
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      input.blur();
-      return results;
-    } finally {
-      hideStyle.remove();
-    }
-  }
-
-  // ── Public entry point ────────────────────────────────────────────────────────
-  async function searchLinkedInPeople(query) {
+  // ── Entry point — csrf token supplied by background, never touches the DOM ────
+  async function searchLinkedInPeople(query, csrf) {
     if (searchInProgress || !query) return;
     searchInProgress = true;
     try {
-      // Try the invisible API route first; fall back to DOM scraping if it fails
-      const apiResults = await searchViaApi(query);
-      const results = (apiResults && apiResults.length > 0)
-        ? apiResults
-        : await searchViaDom(query);
-
+      const results = await searchViaApi(query, csrf);
       chrome.runtime.sendMessage({
         type: 'LINKEDIN_SEARCH_RESULTS',
-        results: results.slice(0, 7),
+        results: (results || []).slice(0, 7),
         query,
       });
     } catch (err) {
@@ -685,7 +610,7 @@
         handlePublish(payload?.text, payload?.attachments || []);
         break;
       case 'SEARCH_LINKEDIN':
-        searchLinkedInPeople(payload?.query);
+        searchLinkedInPeople(payload?.query, payload?.csrf);
         break;
       default:
         break;

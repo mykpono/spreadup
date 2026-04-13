@@ -250,6 +250,31 @@ async function fetchOgMeta(url) {
   }
 }
 
+// ─── LinkedIn people search — fully in background, zero DOM touching ─────────
+// Reads the httpOnly JSESSIONID cookie (inaccessible to content scripts via
+// document.cookie) to extract the CSRF token, then forwards the search request
+// to the content script WITH the csrf value so it can call the Voyager API
+// without ever touching LinkedIn's search bar.
+
+async function getLinkedInCsrf() {
+  const cookie = await chrome.cookies.get({ url: 'https://www.linkedin.com', name: 'JSESSIONID' });
+  return cookie?.value?.replace(/^"|"$/g, '') || null;
+}
+
+async function searchLinkedInPeople(query) {
+  const csrf = await getLinkedInCsrf();
+  const tabs = await chrome.tabs.query({ url: 'https://www.linkedin.com/*' });
+  const tab = tabs[0];
+  if (!tab) return { error: 'No LinkedIn tab found' };
+  // Forward to content script with the csrf token so it can call Voyager API
+  chrome.tabs.sendMessage(tab.id, {
+    type: 'SEARCH_LINKEDIN',
+    payload: { query, csrf },
+    _fromBackground: true,
+  });
+  return { forwarded: true };
+}
+
 // ─── Forward messages to the active LinkedIn tab's content script ────────────
 
 async function forwardToContentScript(msg) {
@@ -274,8 +299,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case 'SMART_FORMAT':  return smartFormatWithAI(msg.payload?.text || '');
       case 'FETCH_OG':         return fetchOgMeta(msg.payload?.url || '');
 
-      // Panel → Background → Content Script (forwarded)
+      // @mention search — handled entirely in background (reads httpOnly cookie)
       case 'SEARCH_LINKEDIN':
+        return searchLinkedInPeople(msg.payload?.query || '');
+
+      // Panel → Background → Content Script (forwarded)
       case 'PUBLISH_POST':
       case 'GET_PROFILE':
       case 'CLOSE_PANEL':
