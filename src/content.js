@@ -226,15 +226,20 @@
       // Step 2: Click "Start a post" — search by text content (classes are obfuscated)
       const trigger = shadowFindByText('[role="button"], button', 'Start a post');
 
-      if (trigger) {
-        // Full event sequence for React compat
-        ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((type) => {
-          trigger.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, composed: true }));
-        });
-
-        // Step 3: Wait for Quill editor to appear inside Shadow DOM
-        editor = await pollFor(() => getLinkedInEditor(), 6000);
+      if (!trigger) {
+        // Fallback: copy to clipboard
+        try { await navigator.clipboard.writeText(text); } catch (_) {}
+        panelFrame?.contentWindow?.postMessage({ type: 'PUBLISH_COPY_FALLBACK' }, '*');
+        return;
       }
+
+      // Full event sequence for React compat
+      ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((evtType) => {
+        trigger.dispatchEvent(new PointerEvent(evtType, { bubbles: true, cancelable: true, composed: true }));
+      });
+
+      // Step 3: Wait for Quill editor to appear inside Shadow DOM
+      editor = await pollFor(() => getLinkedInEditor(), 6000);
     }
 
     if (!editor) {
@@ -248,19 +253,28 @@
     insertTextIntoEditor(editor, text);
 
     // Step 4b: Upload attachments if any
-    if (attachments.length) {
+    if (attachments && attachments.length > 0) {
       await delay(400);
-      await uploadAttachments(attachments);
+      try { await uploadAttachments(attachments); } catch (err) {
+        console.warn('[SpreadUp] Attachment upload failed:', err);
+      }
     }
 
     // Step 5: Wait for LinkedIn to process the text and enable the Post button
-    await delay(800);
+    await delay(1000);
 
     // Step 6: Find and click LinkedIn's own "Post" button (inside shadow DOM)
+    // Be specific: look for button with exact text "Post" that is inside the composer modal
     const postBtn = await pollFor(() => {
-      const btn = shadowFindByText('button', 'Post');
-      return (btn && !btn.disabled) ? btn : null;
-    }, 3000);
+      const candidates = shadowQueryAll('button').filter(
+        (btn) => btn.textContent?.trim() === 'Post' && !btn.disabled
+      );
+      // Prefer the one inside the share box / modal (not nav buttons)
+      return candidates.find((btn) => {
+        const parent = btn.closest('[role="dialog"], .share-box, .share-creation-state');
+        return parent !== null;
+      }) || candidates[0] || null;
+    }, 5000);
 
     if (!postBtn) {
       panelFrame?.contentWindow?.postMessage({ type: 'PUBLISH_NEED_MANUAL', reason: 'Post button not found — click Post manually.' }, '*');
@@ -273,17 +287,21 @@
     const published = await pollFor(() => !getLinkedInEditor(), 15000);
 
     if (published) {
-      // Step 8: Wait for feed to update, then navigate to the published post
-      await delay(2500);
-      const postLink = shadowQueryAll('a[href*="/feed/update/"]')[0];
-      if (postLink?.href) {
-        window.location.href = postLink.href;
-      } else {
-        window.scrollTo({ top: 0, behavior: 'smooth' });
-      }
-    }
+      panelFrame?.contentWindow?.postMessage({ type: 'PUBLISH_SUCCESS' }, '*');
 
-    panelFrame?.contentWindow?.postMessage({ type: 'PUBLISH_SUCCESS' }, '*');
+      // Step 8: Wait for feed to update, then navigate to the published post
+      await delay(3000);
+      const postLinks = shadowQueryAll('a[href*="/feed/update/"]');
+      const latestLink = postLinks[0];
+      if (latestLink?.href) {
+        window.location.href = latestLink.href;
+      } else {
+        window.location.href = 'https://www.linkedin.com/feed/';
+      }
+    } else {
+      // Modal didn't close — post may still be publishing or failed
+      panelFrame?.contentWindow?.postMessage({ type: 'PUBLISH_NEED_MANUAL', reason: 'Post may still be publishing — check LinkedIn.' }, '*');
+    }
   }
 
   // ─── Upload attachments into LinkedIn composer ────────────────────────────────
