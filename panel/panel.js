@@ -1051,7 +1051,7 @@ function renderMentionList(query) {
         <div class="mention-item-avatar" style="background:#1a1a2e;color:#F59E0B;font-weight:700">@</div>
         <div>
           <div class="mention-item-name">@${escapeHtml(q)}</div>
-          <div class="mention-item-sub">Enter to insert · searching LinkedIn…</div>
+          <div class="mention-item-sub">Press Enter to insert</div>
         </div>
       </div>`;
   } else {
@@ -1083,18 +1083,31 @@ function searchLinkedIn(query) {
     return;
   }
 
-  // Debounce: wait 250ms before searching
-  mentionSearchTimer = setTimeout(() => {
-    // Ask content script to search LinkedIn's typeahead
-    window.parent.postMessage({ type: 'SEARCH_LINKEDIN', payload: { query: query.trim() } }, '*');
+  // Debounce: wait 300ms before searching
+  mentionSearchTimer = setTimeout(async () => {
+    const q = query.trim();
 
-    // If no results come back within 2s, clear "Searching..." message
+    // Strategy 1: Ask background script to search via LinkedIn API (has host_permissions)
+    try {
+      const result = await bg('SEARCH_LINKEDIN', { query: q });
+      if (result?.results?.length && mentionActive) {
+        mentionResults = result.results;
+        mentionSelected = 0;
+        renderMentionList(getMentionQuery());
+        return;
+      }
+    } catch (_) {}
+
+    // Strategy 2: Ask content script to scrape names from the LinkedIn page
+    window.parent.postMessage({ type: 'SEARCH_LINKEDIN', payload: { query: q } }, '*');
+
+    // If no results after 2s, update UI
     mentionSearchTimeout = setTimeout(() => {
       if (mentionActive && !mentionResults.length) {
         renderMentionList(getMentionQuery());
       }
     }, 2000);
-  }, 250);
+  }, 300);
 }
 
 // Handle @ key and inline typing

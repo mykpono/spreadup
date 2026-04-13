@@ -220,6 +220,72 @@ FORMATTING RULES:
   return { text: data.content[0]?.text || '' };
 }
 
+// ─── LinkedIn people search ──────────────────────────────────────────────────
+
+async function searchLinkedInPeople(query) {
+  try {
+    // Get the LinkedIn tab to extract cookies for auth
+    const tabs = await chrome.tabs.query({ url: 'https://www.linkedin.com/*', active: true });
+    const linkedInTab = tabs[0];
+    if (!linkedInTab) return { results: [] };
+
+    // Get JSESSIONID cookie for CSRF token
+    const cookies = await chrome.cookies.getAll({ domain: '.linkedin.com', name: 'JSESSIONID' });
+    const csrfToken = cookies[0]?.value?.replace(/"/g, '') || '';
+    if (!csrfToken) return { results: [] };
+
+    // Get li_at cookie for auth
+    const authCookies = await chrome.cookies.getAll({ domain: '.linkedin.com', name: 'li_at' });
+    const liAt = authCookies[0]?.value || '';
+    if (!liAt) return { results: [] };
+
+    const resp = await fetch(
+      `https://www.linkedin.com/voyager/api/typeahead/hitsV2?keywords=${encodeURIComponent(query)}&origin=GLOBAL_SEARCH_HEADER&q=blended`,
+      {
+        headers: {
+          'csrf-token': csrfToken,
+          'cookie': `JSESSIONID="${csrfToken}"; li_at=${liAt}`,
+          'x-restli-protocol-version': '2.0.0',
+          'x-li-lang': 'en_US',
+        },
+      }
+    );
+
+    if (!resp.ok) return { results: [] };
+
+    const data = await resp.json();
+    const results = [];
+
+    // Parse the included array for profile/company data
+    const included = data?.included || [];
+    for (const item of included) {
+      const firstName = item?.firstName;
+      const lastName = item?.lastName;
+      const name = firstName
+        ? `${firstName} ${lastName || ''}`.trim()
+        : item?.title?.text || item?.name;
+      const title = item?.occupation || item?.headline?.text || '';
+
+      if (name && name.length > 1 && name.length < 60 && !/^urn:/.test(name)) {
+        results.push({ name, title, avatar: '' });
+      }
+    }
+
+    // Deduplicate by name
+    const seen = new Set();
+    const unique = results.filter((r) => {
+      if (seen.has(r.name)) return false;
+      seen.add(r.name);
+      return true;
+    });
+
+    return { results: unique.slice(0, 8) };
+  } catch (err) {
+    console.warn('[SpreadUp] LinkedIn search error:', err);
+    return { results: [] };
+  }
+}
+
 // ─── Open Graph metadata fetch ───────────────────────────────────────────────
 
 async function fetchOgMeta(url) {
@@ -261,7 +327,8 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       case 'GET_USER_DATA': return getUserData();
       case 'INCREMENT_POST_COUNT': return incrementPostCount();
       case 'SMART_FORMAT':  return smartFormatWithAI(msg.payload?.text || '');
-      case 'FETCH_OG':      return fetchOgMeta(msg.payload?.url || '');
+      case 'FETCH_OG':         return fetchOgMeta(msg.payload?.url || '');
+      case 'SEARCH_LINKEDIN':  return searchLinkedInPeople(msg.payload?.query || '');
       default: return { error: 'Unknown message type' };
     }
   };
