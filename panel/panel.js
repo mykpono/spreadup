@@ -95,8 +95,8 @@ function showApp() {
   authScreen.classList.add('hidden');
   appScreen.classList.remove('hidden');
   updateUserUI();
-  // Ask content script for LinkedIn profile info
-  window.parent.postMessage({ type: 'GET_PROFILE' }, '*');
+  // Ask content script for LinkedIn profile info (via background relay)
+  chrome.runtime.sendMessage({ type: 'GET_PROFILE' });
 }
 
 btnSignIn.addEventListener('click', async () => {
@@ -162,7 +162,7 @@ function switchTab(tab) {
 }
 
 btnClose.addEventListener('click', () => {
-  window.parent.postMessage({ type: 'CLOSE_PANEL' }, '*');
+  chrome.runtime.sendMessage({ type: 'CLOSE_PANEL' });
 });
 
 // ─── Editor ───────────────────────────────────────────────────────────────────
@@ -587,17 +587,21 @@ function setupActions() {
       name: a.name,
       dataUrl: a.dataUrl,
     }));
-    window.parent.postMessage({ type: 'PUBLISH_POST', payload: { text: state.editorText, attachments } }, '*');
+    chrome.runtime.sendMessage({ type: 'PUBLISH_POST', payload: { text: state.editorText, attachments } });
+    // Reset after a timeout in case the page navigates (no response will come back)
+    setTimeout(() => {
+      closePublishPreview();
+      resetConfirmBtn();
+    }, 5000);
   });
 
   btnPaywallUpgrade.addEventListener('click', () => window.open(PAYMENT_URL, '_blank'));
   btnPaywallClose.addEventListener('click', () => paywallOverlay.classList.add('hidden'));
   btnUpgrade.addEventListener('click', () => window.open(PAYMENT_URL, '_blank'));
 
-  // Listen for messages from content script
-  window.addEventListener('message', (e) => {
-    if (e.source !== window.parent) return;
-    const { type, result, text } = e.data || {};
+  // Listen for messages from content script (via chrome.runtime relay)
+  chrome.runtime.onMessage.addListener((msg) => {
+    const { type, text } = msg || {};
     switch (type) {
       case 'SYNC_EDITOR':
         if (text && !state.editorText) {
@@ -625,7 +629,7 @@ function setupActions() {
         paywallOverlay.classList.remove('hidden');
         break;
       case 'PROFILE_INFO':
-        updatePreviewProfile(e.data);
+        updatePreviewProfile(msg);
         break;
     }
   });
@@ -1054,7 +1058,7 @@ function triggerSearch(query) {
   mentionTimer = setTimeout(() => {
     // Show searching indicator
     mentionList.innerHTML = '<div class="mention-tip">Searching LinkedIn…</div>';
-    window.parent.postMessage({ type: 'SEARCH_LINKEDIN', payload: { query } }, '*');
+    chrome.runtime.sendMessage({ type: 'SEARCH_LINKEDIN', payload: { query } });
   }, 400);
 }
 
@@ -1112,11 +1116,12 @@ editorArea.addEventListener('keydown', (e) => {
   }
 });
 
-// Receive LinkedIn search results from content script
-window.addEventListener('message', (e) => {
-  if (e.source !== window.parent) return;
-  if (e.data?.type === 'LINKEDIN_SEARCH_RESULTS' && mentionActive) {
-    mentionResults = (e.data.results || []).slice(0, 7);
+// Receive LinkedIn search results from content script (via chrome.runtime relay)
+// Note: This listener is merged into the main chrome.runtime.onMessage listener
+// added in setupActions(). We add a second one here for the mention-specific flow.
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg?.type === 'LINKEDIN_SEARCH_RESULTS' && mentionActive) {
+    mentionResults = (msg.results || []).slice(0, 7);
     if (mentionResults.length) mentionSelected = 0;
     renderMentionDropdown(getMentionQuery());
   }

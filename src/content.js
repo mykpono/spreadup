@@ -221,47 +221,143 @@
     return new File([bytes], filename, { type: mime });
   }
 
+  // ─── Visual status toast (shown on LinkedIn page, not in panel) ──────────────
+
+  function showStatusToast(msg) {
+    let toast = document.getElementById('spreadup-status-toast');
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.id = 'spreadup-status-toast';
+      toast.style.cssText = `
+        position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+        background: #1a1a2e; color: #fff; padding: 12px 24px; border-radius: 8px;
+        font-size: 14px; z-index: 999999; box-shadow: 0 4px 16px rgba(0,0,0,0.3);
+        transition: opacity 0.3s;
+      `;
+      document.body.appendChild(toast);
+    }
+    toast.textContent = msg;
+    toast.style.opacity = '1';
+  }
+
+  function hideStatusToast() {
+    const toast = document.getElementById('spreadup-status-toast');
+    if (toast) { toast.style.opacity = '0'; setTimeout(() => toast.remove(), 400); }
+  }
+
+  // ─── Pending publish (survives page navigation) ─────────────────────────────
+
+  async function savePendingPublish(text, attachments) {
+    await chrome.storage.local.set({ pendingPublish: { text, attachments, ts: Date.now() } });
+  }
+
+  async function getPendingPublish() {
+    const { pendingPublish } = await chrome.storage.local.get('pendingPublish');
+    if (!pendingPublish) return null;
+    // Expire after 30 seconds
+    if (Date.now() - pendingPublish.ts > 30000) {
+      await chrome.storage.local.remove('pendingPublish');
+      return null;
+    }
+    return pendingPublish;
+  }
+
+  async function clearPendingPublish() {
+    await chrome.storage.local.remove('pendingPublish');
+  }
+
+  // ─── Resume publish after navigation ────────────────────────────────────────
+
+  async function resumePendingPublish() {
+    const pending = await getPendingPublish();
+    if (!pending) return;
+    await clearPendingPublish();
+
+    showStatusToast('SpreadUp: Opening composer…');
+
+    // Wait for the LinkedIn editor/composer to appear (shareActive=true may auto-open it)
+    let editor = await pollFor(() => getLinkedInEditor(), 5000);
+
+    // If editor didn't auto-open, try clicking "Start a post"
+    if (!editor) {
+      const trigger = shadowFindByText('[role="button"], button', 'Start a post')
+        || shadowQueryAll('[role="button"], button').find((el) => el.textContent?.trim().toLowerCase().includes('start a post'));
+      if (trigger) {
+        trigger.click();
+        editor = await pollFor(() => getLinkedInEditor(), 5000);
+      }
+    }
+
+    if (!editor) {
+      showStatusToast('SpreadUp: Could not open composer — text copied to clipboard. Paste with Cmd+V.');
+      try { await navigator.clipboard.writeText(pending.text); } catch (_) {}
+      await delay(4000);
+      hideStatusToast();
+      return;
+    }
+
+    showStatusToast('SpreadUp: Inserting your post…');
+    insertTextIntoEditor(editor, pending.text);
+
+    // Upload attachments if any
+    if (pending.attachments && pending.attachments.length > 0) {
+      await delay(400);
+      try { await uploadAttachments(pending.attachments); } catch (_) {}
+    }
+
+    showStatusToast('SpreadUp: Post ready — click Post to publish!');
+    await delay(3000);
+    hideStatusToast();
+  }
+
   async function handlePublish(text, attachments = []) {
-    // Hide SpreadUp panel so user can see the LinkedIn composer
     hidePanel();
 
     // Step 1: Check if editor is already open
     let editor = getLinkedInEditor();
 
     if (!editor) {
-      // Step 2: Click "Start a post" — search by text content (classes are obfuscated)
-      // Try exact match first, then partial match for LinkedIn UI variations
+      // Step 2: Try to click "Start a post"
       const trigger = shadowFindByText('[role="button"], button', 'Start a post')
-        || shadowQueryAll('[role="button"], button').find((el) => el.textContent?.trim().toLowerCase().includes('start a post'))
-        || shadowQueryAll('[role="button"], button').find((el) => el.textContent?.trim().toLowerCase().includes('write an article'));
+        || shadowQueryAll('[role="button"], button').find((el) => el.textContent?.trim().toLowerCase().includes('start a post'));
 
-      if (!trigger) {
-        // Fallback: copy to clipboard
-        try { await navigator.clipboard.writeText(text); } catch (_) {}
-        panelFrame?.contentWindow?.postMessage({ type: 'PUBLISH_COPY_FALLBACK' }, '*');
-        return;
+      if (trigger) {
+        // Try native .click() first (works better than synthetic events in some cases)
+        trigger.click();
+        editor = await pollFor(() => getLinkedInEditor(), 3000);
+
+        // If native click failed, try full event sequence
+        if (!editor) {
+          ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((evtType) => {
+            trigger.dispatchEvent(new PointerEvent(evtType, { bubbles: true, cancelable: true, composed: true }));
+          });
+          editor = await pollFor(() => getLinkedInEditor(), 4000);
+        }
+
+        // If synthetic events also failed, try keyboard activation
+        if (!editor) {
+          trigger.focus();
+          trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
+          trigger.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
+          editor = await pollFor(() => getLinkedInEditor(), 3000);
+        }
       }
-
-      // Full event sequence for React compat
-      ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((evtType) => {
-        trigger.dispatchEvent(new PointerEvent(evtType, { bubbles: true, cancelable: true, composed: true }));
-      });
-
-      // Step 3: Wait for Quill editor to appear inside Shadow DOM
-      editor = await pollFor(() => getLinkedInEditor(), 6000);
     }
 
     if (!editor) {
-      // Fallback: copy to clipboard
-      try { await navigator.clipboard.writeText(text); } catch (_) {}
-      panelFrame?.contentWindow?.postMessage({ type: 'PUBLISH_COPY_FALLBACK' }, '*');
+      // All click approaches failed — navigate to feed with shareActive=true
+      // This causes LinkedIn to open the composer on page load
+      showStatusToast('SpreadUp: Opening composer…');
+      await savePendingPublish(text, attachments);
+      window.location.href = 'https://www.linkedin.com/feed/?shareActive=true';
       return;
     }
 
-    // Step 4: Insert text into the Quill editor
+    // Editor is open — insert text
+    showStatusToast('SpreadUp: Inserting your post…');
     insertTextIntoEditor(editor, text);
 
-    // Step 4b: Upload attachments if any
+    // Upload attachments if any
     if (attachments && attachments.length > 0) {
       await delay(400);
       try { await uploadAttachments(attachments); } catch (err) {
@@ -269,49 +365,9 @@
       }
     }
 
-    // Step 5: Wait for LinkedIn to process the text and enable the Post button
-    await delay(800);
-
-    // Step 6: Find and click LinkedIn's own "Post" button (inside shadow DOM)
-    const postBtn = await pollFor(() => {
-      // Exact match first
-      let btn = shadowFindByText('button', 'Post');
-      // Fallback: find submit-style buttons in the composer dialog
-      if (!btn) {
-        btn = shadowQueryAll('button').find((b) => {
-          const t = b.textContent?.trim().toLowerCase();
-          return t === 'post' || t === 'submit' || (t?.includes('post') && t.length < 15);
-        });
-      }
-      return (btn && !btn.disabled) ? btn : null;
-    }, 5000);
-
-    if (!postBtn) {
-      panelFrame?.contentWindow?.postMessage({ type: 'PUBLISH_NEED_MANUAL', reason: 'Post button not found — click Post manually.' }, '*');
-      return;
-    }
-
-    postBtn.click();
-
-    // Step 7: Wait for the modal/editor to close (= post published)
-    const published = await pollFor(() => !getLinkedInEditor(), 15000);
-
-    if (published) {
-      panelFrame?.contentWindow?.postMessage({ type: 'PUBLISH_SUCCESS' }, '*');
-
-      // Step 8: Wait for feed to update, then navigate to the published post
-      await delay(3000);
-      const postLinks = shadowQueryAll('a[href*="/feed/update/"]');
-      const latestLink = postLinks[0];
-      if (latestLink?.href) {
-        window.location.href = latestLink.href;
-      } else {
-        window.location.href = 'https://www.linkedin.com/feed/';
-      }
-    } else {
-      // Modal didn't close — post may still be publishing or failed
-      panelFrame?.contentWindow?.postMessage({ type: 'PUBLISH_NEED_MANUAL', reason: 'Post may still be publishing — check LinkedIn.' }, '*');
-    }
+    showStatusToast('SpreadUp: Post ready — click Post to publish!');
+    await delay(3000);
+    hideStatusToast();
   }
 
   // ─── Upload attachments into LinkedIn composer ────────────────────────────────
@@ -398,10 +454,19 @@
     searchInProgress = true;
 
     try {
-      const input = document.querySelector('input[placeholder="I\'m looking for…"]')
+      // LinkedIn's search bar — try multiple selectors for different UI versions
+      const input = document.querySelector('input[placeholder*="looking for"]')
+        || document.querySelector('input.search-global-typeahead__input')
         || shadowQuery('input[placeholder*="looking for"]')
-        || shadowQuery('input[role="combobox"]');
-      if (!input) { searchInProgress = false; return; }
+        || shadowQuery('input[placeholder*="Search"]')
+        || shadowQuery('input[role="combobox"]')
+        || document.querySelector('input[role="combobox"]');
+      if (!input) {
+        // Send empty results back so panel doesn't hang on "Searching…"
+        chrome.runtime.sendMessage({ type: 'LINKEDIN_SEARCH_RESULTS', results: [], query });
+        searchInProgress = false;
+        return;
+      }
 
       const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
 
@@ -456,11 +521,12 @@
       input.blur();
       showLinkedInSearch();
 
-      panelFrame?.contentWindow?.postMessage({
+      // Send results back to panel via chrome.runtime (panel listens on onMessage)
+      chrome.runtime.sendMessage({
         type: 'LINKEDIN_SEARCH_RESULTS',
         results: results.slice(0, 7),
         query,
-      }, '*');
+      });
     } catch (err) {
       console.warn('[SpreadUp] search error:', err);
       showLinkedInSearch();
@@ -469,47 +535,34 @@
     }
   }
 
-  // ─── Message handler (from panel iframe) ─────────────────────────────────────
+  // ─── Message handler (from panel via chrome.runtime relay) ───────────────────
 
-  function handlePanelMessage(event) {
-    // Accept messages from our panel iframe, or reconnect if panelFrame was lost
-    if (panelFrame && event.source !== panelFrame.contentWindow) return;
-    if (!panelFrame) {
-      // After extension reload, panelFrame is null. Try to reconnect.
-      const existing = document.getElementById('spreadup-panel');
-      if (existing && event.source === existing.contentWindow) {
-        panelFrame = existing;
-      } else {
-        return;
-      }
-    }
-    const { type, payload } = event.data || {};
+  function handleMessage(msg) {
+    const { type, payload } = msg || {};
+    if (!type) return;
 
     switch (type) {
       case 'CLOSE_PANEL':
         hidePanel();
         break;
       case 'INSERT_TEXT':
-        insertTextIntoEditor(getLinkedInEditor(), payload.text);
+        insertTextIntoEditor(getLinkedInEditor(), payload?.text);
         break;
       case 'GET_EDITOR_TEXT': {
         const editor = getLinkedInEditor();
-        panelFrame.contentWindow?.postMessage(
-          { type: 'EDITOR_TEXT', text: editor?.innerText || '' },
-          '*'
-        );
+        chrome.runtime.sendMessage({ type: 'EDITOR_TEXT', text: editor?.innerText || '' });
         break;
       }
       case 'GET_PROFILE': {
         const profile = getLinkedInProfile();
-        panelFrame.contentWindow?.postMessage({ type: 'PROFILE_INFO', ...profile }, '*');
+        chrome.runtime.sendMessage({ type: 'PROFILE_INFO', ...profile });
         break;
       }
       case 'PUBLISH_POST':
-        handlePublish(payload.text, payload.attachments || []);
+        handlePublish(payload?.text, payload?.attachments || []);
         break;
       case 'SEARCH_LINKEDIN':
-        searchLinkedInPeople(payload.query);
+        searchLinkedInPeople(payload?.query);
         break;
       default:
         break;
@@ -521,9 +574,13 @@
   function init() {
     injectTriggerButton();
 
-    // Always listen for panel messages (needed after extension reload when
-    // the panel iframe already exists but createPanel() hasn't been called)
-    window.addEventListener('message', handlePanelMessage);
+    // Listen for messages from panel (relayed via background service worker)
+    chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+      // Only handle messages forwarded by the background script
+      if (msg._fromBackground) {
+        handleMessage(msg);
+      }
+    });
 
     // Reconnect to existing panel iframe (e.g. after extension reload)
     const existing = document.getElementById('spreadup-panel');
@@ -531,6 +588,9 @@
       panelFrame = existing;
       panelVisible = existing.style.display !== 'none';
     }
+
+    // Check for pending publish (e.g. after navigate-to-share fallback)
+    resumePendingPublish();
   }
 
   if (document.readyState === 'loading') {

@@ -220,72 +220,6 @@ FORMATTING RULES:
   return { text: data.content[0]?.text || '' };
 }
 
-// ─── LinkedIn people search ──────────────────────────────────────────────────
-
-async function searchLinkedInPeople(query) {
-  try {
-    // Find the LinkedIn tab — we'll execute search in its main world
-    const tabs = await chrome.tabs.query({ url: 'https://www.linkedin.com/*' });
-    const tab = tabs[0];
-    if (!tab) return { results: [] };
-
-    // Execute search in the page's MAIN world — this has full access to
-    // LinkedIn's cookies and session, bypassing CSP and origin issues
-    const injectionResults = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      world: 'MAIN',
-      args: [query],
-      func: async (q) => {
-        try {
-          const csrf = document.cookie.match(/JSESSIONID="?([^";]+)/)?.[1] || '';
-          if (!csrf) return [];
-
-          const resp = await fetch(
-            `https://www.linkedin.com/voyager/api/typeahead/hitsV2?keywords=${encodeURIComponent(q)}&origin=GLOBAL_SEARCH_HEADER&q=blended`,
-            {
-              headers: {
-                'csrf-token': csrf,
-                'x-restli-protocol-version': '2.0.0',
-              },
-              credentials: 'include',
-            }
-          );
-          if (!resp.ok) return [];
-
-          const data = await resp.json();
-          const items = data?.included || data?.elements || [];
-          const results = [];
-          const seen = new Set();
-          for (const item of items) {
-            let name = null, title = '';
-            if (item.firstName) {
-              name = `${item.firstName} ${item.lastName || ''}`.trim();
-              title = item.occupation || '';
-            } else if (item.title?.text) {
-              name = item.title.text;
-              title = item.subtext?.text || item.headline?.text || '';
-            }
-            if (name && name.length > 1 && name.length < 60 && !/^urn:/.test(name) && !seen.has(name)) {
-              seen.add(name);
-              results.push({ name, title });
-            }
-            if (results.length >= 7) break;
-          }
-          return results;
-        } catch (err) {
-          return [];
-        }
-      },
-    });
-
-    const results = injectionResults?.[0]?.result || [];
-    return { results };
-  } catch (err) {
-    console.warn('[SpreadUp] LinkedIn search error:', err);
-    return { results: [] };
-  }
-}
-
 // ─── Open Graph metadata fetch ───────────────────────────────────────────────
 
 async function fetchOgMeta(url) {
@@ -316,9 +250,20 @@ async function fetchOgMeta(url) {
   }
 }
 
-// ─── Message router (content script ↔ background) ────────────────────────────
+// ─── Forward messages to the active LinkedIn tab's content script ────────────
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+async function forwardToContentScript(msg) {
+  const tabs = await chrome.tabs.query({ url: 'https://www.linkedin.com/*' });
+  const tab = tabs[0];
+  if (!tab) return { error: 'No LinkedIn tab found' };
+  // Forward with a source marker so content script knows it came via background
+  chrome.tabs.sendMessage(tab.id, { ...msg, _fromBackground: true });
+  return { forwarded: true };
+}
+
+// ─── Message router (panel / content script ↔ background) ───────────────────
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   const handle = async () => {
     switch (msg.type) {
       case 'SIGN_IN':       return signIn();
@@ -328,7 +273,24 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       case 'INCREMENT_POST_COUNT': return incrementPostCount();
       case 'SMART_FORMAT':  return smartFormatWithAI(msg.payload?.text || '');
       case 'FETCH_OG':         return fetchOgMeta(msg.payload?.url || '');
-      case 'SEARCH_LINKEDIN':  return searchLinkedInPeople(msg.payload?.query || '');
+
+      // Panel → Background → Content Script (forwarded)
+      case 'SEARCH_LINKEDIN':
+      case 'PUBLISH_POST':
+      case 'GET_PROFILE':
+      case 'CLOSE_PANEL':
+        return forwardToContentScript(msg);
+
+      // Content Script → Background → Panel (broadcast to all extension pages)
+      // These are no-ops here; the panel receives them via chrome.runtime.onMessage
+      case 'LINKEDIN_SEARCH_RESULTS':
+      case 'PUBLISH_SUCCESS':
+      case 'PUBLISH_NEED_MANUAL':
+      case 'PUBLISH_COPY_FALLBACK':
+      case 'PROFILE_INFO':
+      case 'EDITOR_TEXT':
+        return { ok: true };
+
       default: return { error: 'Unknown message type' };
     }
   };
