@@ -1035,16 +1035,10 @@ function triggerSearch(query) {
   clearTimeout(mentionTimer);
   if (!query || query.length < 1) return;
 
-  // Debounce 150ms for near real-time feel
-  // Background script runs the search in LinkedIn tab's MAIN world via chrome.scripting
+  // Debounce 300ms — content script types into LinkedIn's search bar and scrapes results
   mentionTimer = setTimeout(() => {
-    chrome.runtime.sendMessage({ type: 'SEARCH_LINKEDIN', payload: { query } }, (resp) => {
-      if (!mentionActive) return;
-      mentionResults = (resp?.results || []).slice(0, 7);
-      if (mentionResults.length) mentionSelected = 0;
-      renderMentionDropdown(getMentionQuery());
-    });
-  }, 150);
+    window.parent.postMessage({ type: 'SEARCH_LINKEDIN', payload: { query } }, '*');
+  }, 300);
 }
 
 // Track @ typing in editor
@@ -1101,7 +1095,15 @@ editorArea.addEventListener('keydown', (e) => {
   }
 });
 
-// (Search results handled in triggerSearch callback via chrome.runtime.sendMessage)
+// Receive LinkedIn search results from content script
+window.addEventListener('message', (e) => {
+  if (e.source !== window.parent) return;
+  if (e.data?.type === 'LINKEDIN_SEARCH_RESULTS' && mentionActive) {
+    mentionResults = (e.data.results || []).slice(0, 7);
+    if (mentionResults.length) mentionSelected = 0;
+    renderMentionDropdown(getMentionQuery());
+  }
+});
 
 // ─── File / image attachments ────────────────────────────────────────────────
 

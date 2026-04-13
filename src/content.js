@@ -359,11 +359,73 @@
     await delay(2000);
   }
 
+  // ─── LinkedIn people search via DOM scraping ─────────────────────────────────
+  // LinkedIn's old Voyager REST APIs are gone (404). The new RSC/SDUI endpoints
+  // are session-coupled and can't be called programmatically. Instead, we type
+  // into LinkedIn's own search bar, scrape the dropdown results, then clear it.
+
+  let searchInProgress = false;
+
+  async function searchLinkedInPeople(query) {
+    if (searchInProgress || !query || query.length < 1) return;
+    searchInProgress = true;
+
+    try {
+      const input = document.querySelector('input[placeholder="I\'m looking for…"]')
+        || shadowQuery('input[placeholder*="looking for"]')
+        || shadowQuery('input[role="combobox"]');
+      if (!input) { searchInProgress = false; return; }
+
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+
+      // Clear any existing search
+      setter.call(input, '');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      await delay(100);
+
+      // Type the query
+      input.focus();
+      setter.call(input, query);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+
+      // Wait for dropdown results (poll up to 2s)
+      let results = [];
+      const start = Date.now();
+      while (Date.now() - start < 2000) {
+        await delay(200);
+        const options = [...document.querySelectorAll('[role="option"]'),
+                         ...shadowQueryAll('[role="option"]')];
+        if (options.length > 0) {
+          results = options
+            .map((o) => {
+              const text = o.textContent?.trim() || '';
+              const parts = text.split('•').map((s) => s.trim());
+              return { name: parts[0] || '', title: parts.slice(1).join(' · ').substring(0, 80) };
+            })
+            .filter((r) => r.name && r.name.length > 1 && r.name.length < 50
+              && r.name !== 'See all results');
+          break;
+        }
+      }
+
+      // Clear search immediately
+      setter.call(input, '');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.blur();
+
+      panelFrame?.contentWindow?.postMessage({
+        type: 'LINKEDIN_SEARCH_RESULTS',
+        results: results.slice(0, 7),
+        query,
+      }, '*');
+    } catch (err) {
+      console.warn('[SpreadUp] search error:', err);
+    } finally {
+      searchInProgress = false;
+    }
+  }
+
   // ─── Message handler (from panel iframe) ─────────────────────────────────────
-  // Note: LinkedIn search is handled by the panel calling the background script
-  // directly via chrome.runtime.sendMessage. The background uses
-  // chrome.scripting.executeScript with world:'MAIN' to run the search in
-  // LinkedIn's page context (full cookie/session access).
 
   function handlePanelMessage(event) {
     if (event.source !== panelFrame?.contentWindow) return;
@@ -391,6 +453,9 @@
       }
       case 'PUBLISH_POST':
         handlePublish(payload.text, payload.attachments || []);
+        break;
+      case 'SEARCH_LINKEDIN':
+        searchLinkedInPeople(payload.query);
         break;
       default:
         break;
