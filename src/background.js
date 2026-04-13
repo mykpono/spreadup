@@ -250,29 +250,88 @@ async function fetchOgMeta(url) {
   }
 }
 
-// ─── LinkedIn people search — fully in background, zero DOM touching ─────────
-// Reads the httpOnly JSESSIONID cookie (inaccessible to content scripts via
-// document.cookie) to extract the CSRF token, then forwards the search request
-// to the content script WITH the csrf value so it can call the Voyager API
-// without ever touching LinkedIn's search bar.
+// ─── LinkedIn people search — entirely in background, zero DOM touching ──────
+// Reads LinkedIn cookies (including httpOnly) via chrome.cookies API, then calls
+// the Voyager typeahead endpoint directly from the service worker. Results are
+// broadcast to the panel via chrome.runtime.sendMessage — the content script is
+// never involved in the search flow.
 
-async function getLinkedInCsrf() {
-  const cookie = await chrome.cookies.get({ url: 'https://www.linkedin.com', name: 'JSESSIONID' });
-  return cookie?.value?.replace(/^"|"$/g, '') || null;
+async function getLinkedInCookies() {
+  const cookies = await chrome.cookies.getAll({ url: 'https://www.linkedin.com' });
+  const csrf = cookies.find(c => c.name === 'JSESSIONID')?.value?.replace(/^"|"$/g, '') || null;
+  const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+  return { csrf, cookieHeader };
 }
 
 async function searchLinkedInPeople(query) {
-  const csrf = await getLinkedInCsrf();
-  const tabs = await chrome.tabs.query({ url: 'https://www.linkedin.com/*' });
-  const tab = tabs[0];
-  if (!tab) return { error: 'No LinkedIn tab found' };
-  // Forward to content script with the csrf token so it can call Voyager API
-  chrome.tabs.sendMessage(tab.id, {
-    type: 'SEARCH_LINKEDIN',
-    payload: { query, csrf },
-    _fromBackground: true,
-  });
-  return { forwarded: true };
+  if (!query) return { results: [], query };
+
+  try {
+    const { csrf, cookieHeader } = await getLinkedInCookies();
+    if (!csrf) {
+      console.warn('[SpreadUp] No JSESSIONID cookie — user may not be logged into LinkedIn');
+      chrome.runtime.sendMessage({ type: 'LINKEDIN_SEARCH_RESULTS', results: [], query });
+      return { ok: true };
+    }
+
+    const params = new URLSearchParams({
+      keywords: query,
+      origin: 'OTHER',
+      q: 'type',
+      type: 'PEOPLE',
+    });
+
+    const res = await fetch(`https://www.linkedin.com/voyager/api/typeahead/hitsV2?${params}`, {
+      headers: {
+        'csrf-token':                csrf,
+        'x-restli-protocol-version': '2.0.0',
+        'x-li-lang':                 'en_US',
+        'accept':                    'application/vnd.linkedin.normalized+json+2.1',
+        'cookie':                    cookieHeader,
+      },
+    });
+
+    if (!res.ok) {
+      console.warn(`[SpreadUp] Voyager search returned ${res.status}`);
+      chrome.runtime.sendMessage({ type: 'LINKEDIN_SEARCH_RESULTS', results: [], query });
+      return { ok: true };
+    }
+
+    const json = await res.json();
+    const elements = json?.data?.elements ?? json?.elements ?? [];
+
+    const results = elements
+      .map((el) => {
+        const hit = el.hitInfo ? Object.values(el.hitInfo)[0] : el;
+        const name  = hit?.text?.text   ?? hit?.name     ?? '';
+        const title = hit?.subtext?.text ?? hit?.headline ?? '';
+
+        const artifact =
+          hit?.image?.attributes?.[0]?.detailData
+            ?.['com.linkedin.voyager.dash.common.image.ImageViewModel']
+            ?.artifacts?.[0]
+          ?? hit?.image?.attributes?.[0]?.detailData
+            ?.['com.linkedin.voyager.common.image.ImageViewModel']
+            ?.artifacts?.[0];
+
+        const avatar = artifact?.fileIdentifyingUrlPathSegment
+          ? `https://media.licdn.com/dms/image/${artifact.fileIdentifyingUrlPathSegment}`
+          : (hit?.image?.rootUrl
+              ? hit.image.rootUrl + (artifact?.fileIdentifyingUrlPathSegment ?? '')
+              : '');
+
+        return { name, title, avatar };
+      })
+      .filter((r) => r.name && r.name.length > 1 && r.name.length < 60)
+      .slice(0, 7);
+
+    chrome.runtime.sendMessage({ type: 'LINKEDIN_SEARCH_RESULTS', results, query });
+    return { ok: true };
+  } catch (err) {
+    console.warn('[SpreadUp] search error:', err);
+    chrome.runtime.sendMessage({ type: 'LINKEDIN_SEARCH_RESULTS', results: [], query });
+    return { ok: true };
+  }
 }
 
 // ─── Forward messages to the active LinkedIn tab's content script ────────────

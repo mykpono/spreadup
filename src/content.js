@@ -483,16 +483,12 @@
     await delay(2000);
   }
 
-  // ─── LinkedIn people search via Voyager API ──────────────────────────────────
-  // The CSRF token (from httpOnly JSESSIONID cookie) is supplied by the background
-  // service worker, which can read httpOnly cookies via chrome.cookies.get().
-  // The content script makes the actual fetch with credentials:include so the
-  // browser automatically attaches the session cookies — no DOM touching needed.
+  // ─── CSRF helper (used by publishViaApi) ──────────────────────────────────────
+  // LinkedIn stores the CSRF token in the JSESSIONID cookie.
+  // NOTE: @mention search is handled entirely in the background service worker
+  // (which reads httpOnly cookies via chrome.cookies.get). This helper is only
+  // needed for the publish API calls that run from the content script.
 
-  let searchInProgress = false;
-
-  // ── Parse CSRF from document.cookie (readable if not httpOnly) ───────────────
-  // Used as a fallback for publishViaApi. For search, the csrf comes from background.
   function getLinkedInCsrf() {
     return document.cookie
       .split(';')
@@ -500,87 +496,6 @@
       .find((c) => c.startsWith('JSESSIONID='))
       ?.split('=').slice(1).join('=')
       ?.replace(/^"|"$/g, '') || null;
-  }
-
-  // ── Call the Voyager typeahead endpoint ───────────────────────────────────────
-  // csrfOverride: CSRF token from background (bypasses httpOnly restriction).
-  async function searchViaApi(query, csrfOverride) {
-    const csrf = csrfOverride || getLinkedInCsrf();
-    if (!csrf) return null;
-
-    const params = new URLSearchParams({
-      keywords: query,
-      origin:   'OTHER',
-      q:        'type',
-      type:     'PEOPLE',
-    });
-
-    let res;
-    try {
-      res = await fetch(`/voyager/api/typeahead/hitsV2?${params}`, {
-        credentials: 'include',
-        headers: {
-          'csrf-token':                  csrf,
-          'x-restli-protocol-version':   '2.0.0',
-          'x-li-lang':                   'en_US',
-          'accept':                      'application/vnd.linkedin.normalized+json+2.1',
-        },
-      });
-    } catch (_) {
-      return null;
-    }
-
-    if (!res.ok) return null;
-
-    let json;
-    try { json = await res.json(); } catch (_) { return null; }
-
-    // Response shape differs across LinkedIn versions — handle both
-    const elements = json?.data?.elements ?? json?.elements ?? [];
-
-    return elements
-      .map((el) => {
-        const hit = el.hitInfo ? Object.values(el.hitInfo)[0] : el;
-
-        const name  = hit?.text?.text   ?? hit?.name     ?? '';
-        const title = hit?.subtext?.text ?? hit?.headline ?? '';
-
-        const artifact =
-          hit?.image?.attributes?.[0]?.detailData
-            ?.['com.linkedin.voyager.dash.common.image.ImageViewModel']
-            ?.artifacts?.[0]
-          ?? hit?.image?.attributes?.[0]?.detailData
-            ?.['com.linkedin.voyager.common.image.ImageViewModel']
-            ?.artifacts?.[0];
-
-        const avatar = artifact?.fileIdentifyingUrlPathSegment
-          ? `https://media.licdn.com/dms/image/${artifact.fileIdentifyingUrlPathSegment}`
-          : (hit?.image?.rootUrl
-              ? hit.image.rootUrl + (artifact?.fileIdentifyingUrlPathSegment ?? '')
-              : '');
-
-        return { name, title, avatar };
-      })
-      .filter((r) => r.name && r.name.length > 1 && r.name.length < 60);
-  }
-
-  // ── Entry point — csrf token supplied by background, never touches the DOM ────
-  async function searchLinkedInPeople(query, csrf) {
-    if (searchInProgress || !query) return;
-    searchInProgress = true;
-    try {
-      const results = await searchViaApi(query, csrf);
-      chrome.runtime.sendMessage({
-        type: 'LINKEDIN_SEARCH_RESULTS',
-        results: (results || []).slice(0, 7),
-        query,
-      });
-    } catch (err) {
-      console.warn('[SpreadUp] search error:', err);
-      chrome.runtime.sendMessage({ type: 'LINKEDIN_SEARCH_RESULTS', results: [], query });
-    } finally {
-      searchInProgress = false;
-    }
   }
 
   // ─── Message handler (from panel via chrome.runtime relay) ───────────────────
@@ -609,9 +524,7 @@
       case 'PUBLISH_POST':
         handlePublish(payload?.text, payload?.attachments || []);
         break;
-      case 'SEARCH_LINKEDIN':
-        searchLinkedInPeople(payload?.query, payload?.csrf);
-        break;
+      // SEARCH_LINKEDIN is handled entirely in background.js — no content script involved
       default:
         break;
     }
