@@ -261,19 +261,12 @@
     }
 
     // Step 5: Wait for LinkedIn to process the text and enable the Post button
-    await delay(1000);
+    await delay(800);
 
     // Step 6: Find and click LinkedIn's own "Post" button (inside shadow DOM)
-    // Be specific: look for button with exact text "Post" that is inside the composer modal
     const postBtn = await pollFor(() => {
-      const candidates = shadowQueryAll('button').filter(
-        (btn) => btn.textContent?.trim() === 'Post' && !btn.disabled
-      );
-      // Prefer the one inside the share box / modal (not nav buttons)
-      return candidates.find((btn) => {
-        const parent = btn.closest('[role="dialog"], .share-box, .share-creation-state');
-        return parent !== null;
-      }) || candidates[0] || null;
+      const btn = shadowFindByText('button', 'Post');
+      return (btn && !btn.disabled) ? btn : null;
     }, 5000);
 
     if (!postBtn) {

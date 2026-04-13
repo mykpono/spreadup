@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "SpreadUp",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Write great LinkedIn posts fast. Free for 50 posts, then $20 one-time.",
 
   "permissions": [
