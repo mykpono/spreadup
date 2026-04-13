@@ -388,22 +388,34 @@
       setter.call(input, query);
       input.dispatchEvent(new Event('input', { bubbles: true }));
 
-      // Wait for dropdown results (poll up to 2s)
+      // Wait for REAL search results (not history items) to appear (poll up to 2.5s)
+      // History items contain "recent entity history" in text.
+      // Real results have "•" separators (e.g. "name• 1st • title").
       let results = [];
       const start = Date.now();
-      while (Date.now() - start < 2000) {
-        await delay(200);
+      while (Date.now() - start < 2500) {
+        await delay(250);
         const options = [...document.querySelectorAll('[role="option"]'),
                          ...shadowQueryAll('[role="option"]')];
-        if (options.length > 0) {
-          results = options
+        const realResults = options.filter((o) => {
+          const text = o.textContent?.trim() || '';
+          return text.includes('•') && !text.includes('recent entity history');
+        });
+        if (realResults.length > 0) {
+          results = realResults
             .map((o) => {
               const text = o.textContent?.trim() || '';
               const parts = text.split('•').map((s) => s.trim());
-              return { name: parts[0] || '', title: parts.slice(1).join(' · ').substring(0, 80) };
+              const name = parts[0] || '';
+              // parts[1] is connection degree (1st/2nd/3rd/Company/Product)
+              // parts[2+] is the title/description
+              const title = parts.slice(2).join(' · ').substring(0, 80)
+                || parts[1] || '';
+              return { name, title };
             })
             .filter((r) => r.name && r.name.length > 1 && r.name.length < 50
-              && r.name !== 'See all results');
+              && r.name.toLowerCase() !== 'see all results'
+              && r.name.toLowerCase() !== 'show all');
           break;
         }
       }
