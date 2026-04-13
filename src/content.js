@@ -39,6 +39,13 @@
   function createPanel() {
     if (panelFrame) return;
 
+    // Check if panel iframe already exists (e.g. after extension reload)
+    const existing = document.getElementById('spreadup-panel');
+    if (existing) {
+      // Remove stale iframe — its extension context is invalidated
+      existing.remove();
+    }
+
     panelFrame = document.createElement('iframe');
     panelFrame.id = 'spreadup-panel';
     panelFrame.src = chrome.runtime.getURL('panel/panel.html');
@@ -378,6 +385,10 @@
 
       const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
 
+      // Hide LinkedIn's search dropdown so user doesn't see it flash
+      const searchContainer = input.closest('[class*="search"]') || input.parentElement?.parentElement;
+      let dropdownEl = null;
+
       // Clear any existing search
       setter.call(input, '');
       input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -389,8 +400,6 @@
       input.dispatchEvent(new Event('input', { bubbles: true }));
 
       // Wait for REAL search results (not history items) to appear (poll up to 2.5s)
-      // History items contain "recent entity history" in text.
-      // Real results have "•" separators (e.g. "name• 1st • title").
       let results = [];
       const start = Date.now();
       while (Date.now() - start < 2500) {
@@ -401,14 +410,20 @@
           const text = o.textContent?.trim() || '';
           return text.includes('•') && !text.includes('recent entity history');
         });
+
+        // Hide the dropdown as soon as we detect it (so user doesn't see it)
+        if (!dropdownEl) {
+          dropdownEl = document.querySelector('[role="listbox"]')
+            || shadowQuery('[role="listbox"]');
+          if (dropdownEl) dropdownEl.style.opacity = '0';
+        }
+
         if (realResults.length > 0) {
           results = realResults
             .map((o) => {
               const text = o.textContent?.trim() || '';
               const parts = text.split('•').map((s) => s.trim());
               const name = parts[0] || '';
-              // parts[1] is connection degree (1st/2nd/3rd/Company/Product)
-              // parts[2+] is the title/description
               const title = parts.slice(2).join(' · ').substring(0, 80)
                 || parts[1] || '';
               return { name, title };
@@ -420,10 +435,11 @@
         }
       }
 
-      // Clear search immediately
+      // Clear search and restore visibility
       setter.call(input, '');
       input.dispatchEvent(new Event('input', { bubbles: true }));
       input.blur();
+      if (dropdownEl) dropdownEl.style.opacity = '';
 
       panelFrame?.contentWindow?.postMessage({
         type: 'LINKEDIN_SEARCH_RESULTS',
@@ -440,7 +456,17 @@
   // ─── Message handler (from panel iframe) ─────────────────────────────────────
 
   function handlePanelMessage(event) {
-    if (event.source !== panelFrame?.contentWindow) return;
+    // Accept messages from our panel iframe, or reconnect if panelFrame was lost
+    if (panelFrame && event.source !== panelFrame.contentWindow) return;
+    if (!panelFrame) {
+      // After extension reload, panelFrame is null. Try to reconnect.
+      const existing = document.getElementById('spreadup-panel');
+      if (existing && event.source === existing.contentWindow) {
+        panelFrame = existing;
+      } else {
+        return;
+      }
+    }
     const { type, payload } = event.data || {};
 
     switch (type) {

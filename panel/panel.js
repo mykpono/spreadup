@@ -982,7 +982,9 @@ function positionDropdown() {
 function insertMention(name) {
   const before = editorArea.value.slice(0, mentionAtPos);
   const after  = editorArea.value.slice(editorArea.selectionStart);
-  const tag = `@${name} `;
+  // Bold the name using Unicode so it stands out as a mention
+  const boldName = convertText(name, 'bold');
+  const tag = `@${boldName} `;
   editorArea.value = before + tag + after;
   editorArea.setSelectionRange(before.length + tag.length, before.length + tag.length);
   state.editorText = editorArea.value;
