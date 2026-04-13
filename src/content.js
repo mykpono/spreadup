@@ -320,62 +320,114 @@
     hideStatusToast();
   }
 
+  // ─── Get current user's member URN via Voyager /me ──────────────────────────
+
+  async function getMyMemberUrn() {
+    const csrf = getLinkedInCsrf();
+    if (!csrf) return null;
+    try {
+      const res = await fetch('/voyager/api/me', {
+        credentials: 'include',
+        headers: {
+          'csrf-token':                csrf,
+          'x-restli-protocol-version': '2.0.0',
+          'accept':                    'application/vnd.linkedin.normalized+json+2.1',
+        },
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data?.data?.entityUrn ?? null;   // "urn:li:member:123456789"
+    } catch (_) { return null; }
+  }
+
+  // ─── Post directly via LinkedIn Voyager API — no composer, no confirmation ───
+
+  async function publishViaApi(text) {
+    const csrf = getLinkedInCsrf();
+    if (!csrf) return null;
+
+    const authorUrn = await getMyMemberUrn();
+    if (!authorUrn) return null;
+
+    try {
+      const res = await fetch('/voyager/api/contentcreation/normShares', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'csrf-token':                csrf,
+          'content-type':              'application/json',
+          'x-restli-protocol-version': '2.0.0',
+          'accept':                    'application/vnd.linkedin.normalized+json+2.1',
+        },
+        body: JSON.stringify({
+          visibleToGuest: true,
+          shareAudience: { 'com.linkedin.voyager.feed.MemberAudience': { values: [] } },
+          shareMediaCategory: 'NONE',
+          subject: '',
+          text: { text },
+        }),
+      });
+      if (!res.ok) return null;
+      const data = await res.json();
+      const urn = data?.value?.id ?? data?.id;
+      if (!urn) return null;
+      return `https://www.linkedin.com/feed/update/${encodeURIComponent(urn)}/`;
+    } catch (_) { return null; }
+  }
+
+  // ─── Publish flow ─────────────────────────────────────────────────────────────
+
   async function handlePublish(text, attachments = []) {
+    // ── Fast path: post directly via API, navigate to the new post ─────────────
+    showStatusToast('SpreadUp: Posting…');
+    const postUrl = await publishViaApi(text);
+
+    if (postUrl) {
+      chrome.runtime.sendMessage({ type: 'PUBLISH_SUCCESS', postUrl });
+      await delay(600); // Let the success message reach the panel before nav
+      window.location.href = postUrl;
+      return;
+    }
+
+    // ── Fallback: open LinkedIn's composer (API unavailable) ───────────────────
+    showStatusToast('SpreadUp: Opening composer…');
     hidePanel();
 
-    // Step 1: Check if editor is already open
     let editor = getLinkedInEditor();
 
     if (!editor) {
-      // Step 2: Try to click "Start a post"
       const trigger = shadowFindByText('[role="button"], button', 'Start a post')
-        || shadowQueryAll('[role="button"], button').find((el) => el.textContent?.trim().toLowerCase().includes('start a post'));
+        || shadowQueryAll('[role="button"], button').find(
+             (el) => el.textContent?.trim().toLowerCase().includes('start a post'));
 
       if (trigger) {
-        // Try native .click() first (works better than synthetic events in some cases)
         trigger.click();
         editor = await pollFor(() => getLinkedInEditor(), 3000);
 
-        // If native click failed, try full event sequence
         if (!editor) {
-          ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((evtType) => {
-            trigger.dispatchEvent(new PointerEvent(evtType, { bubbles: true, cancelable: true, composed: true }));
-          });
+          ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((evtType) =>
+            trigger.dispatchEvent(new PointerEvent(evtType, { bubbles: true, cancelable: true, composed: true }))
+          );
           editor = await pollFor(() => getLinkedInEditor(), 4000);
-        }
-
-        // If synthetic events also failed, try keyboard activation
-        if (!editor) {
-          trigger.focus();
-          trigger.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', bubbles: true }));
-          trigger.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', bubbles: true }));
-          editor = await pollFor(() => getLinkedInEditor(), 3000);
         }
       }
     }
 
     if (!editor) {
-      // All click approaches failed — navigate to feed with shareActive=true
-      // This causes LinkedIn to open the composer on page load
-      showStatusToast('SpreadUp: Opening composer…');
       await savePendingPublish(text, attachments);
       window.location.href = 'https://www.linkedin.com/feed/?shareActive=true';
       return;
     }
 
-    // Editor is open — insert text
-    showStatusToast('SpreadUp: Inserting your post…');
     insertTextIntoEditor(editor, text);
 
-    // Upload attachments if any
-    if (attachments && attachments.length > 0) {
+    if (attachments?.length) {
       await delay(400);
-      try { await uploadAttachments(attachments); } catch (err) {
-        console.warn('[SpreadUp] Attachment upload failed:', err);
-      }
+      try { await uploadAttachments(attachments); } catch (_) {}
     }
 
-    showStatusToast('SpreadUp: Post ready — click Post to publish!');
+    chrome.runtime.sendMessage({ type: 'PUBLISH_NEED_MANUAL' });
+    showStatusToast('SpreadUp: Ready — click Post to publish!');
     await delay(3000);
     hideStatusToast();
   }

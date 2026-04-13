@@ -579,20 +579,20 @@ function setupActions() {
 
   $('#pp-confirm').addEventListener('click', async () => {
     const btn = $('#pp-confirm');
-    btn.textContent = 'Publishing…';
+    btn.textContent = 'Posting…';
     btn.disabled = true;
-    // Send attachments as data URLs (File objects can't cross postMessage to parent)
     const attachments = state.attachments.map((a) => ({
       type: a.type,
       name: a.name,
       dataUrl: a.dataUrl,
     }));
     chrome.runtime.sendMessage({ type: 'PUBLISH_POST', payload: { text: state.editorText, attachments } });
-    // Reset after a timeout in case the page navigates (no response will come back)
+    // Safety net: if the page navigates (API success) we never hear back —
+    // if it doesn't navigate within 12s something went wrong, reset.
     setTimeout(() => {
       closePublishPreview();
       resetConfirmBtn();
-    }, 5000);
+    }, 12000);
   });
 
   btnPaywallUpgrade.addEventListener('click', () => window.open(PAYMENT_URL, '_blank'));
@@ -611,14 +611,21 @@ function setupActions() {
         }
         break;
       case 'PUBLISH_SUCCESS':
+        // Page is about to navigate to the new post — clear editor for next time
         closePublishPreview();
-        resetConfirmBtn();
-        showToast('Published on LinkedIn ✓');
+        showToast('✓ Posted! Taking you there…');
+        editorArea.value = '';
+        state.editorText = '';
+        state.attachments = [];
+        renderAttachments();
+        updateStats();
+        updatePreview();
         break;
       case 'PUBLISH_NEED_MANUAL':
+        // API unavailable — text is in the LinkedIn composer
         closePublishPreview();
         resetConfirmBtn();
-        showToast('Text is in the composer — click Post in LinkedIn to publish');
+        showToast('Your post is ready in LinkedIn — click Post to publish');
         break;
       case 'PUBLISH_COPY_FALLBACK':
         closePublishPreview();
@@ -665,7 +672,7 @@ function openPublishPreview() {
 
   // Reset confirm button
   const btn = $('#pp-confirm');
-  btn.textContent = 'Confirm & Publish on LinkedIn';
+  btn.textContent = 'Post Now';
   btn.disabled = false;
 
   overlay.classList.remove('hidden');
@@ -678,7 +685,7 @@ function closePublishPreview() {
 
 function resetConfirmBtn() {
   const btn = $('#pp-confirm');
-  if (btn) { btn.textContent = 'Publish'; btn.disabled = false; }
+  if (btn) { btn.textContent = 'Post Now'; btn.disabled = false; }
 }
 
 // ─── Toast ────────────────────────────────────────────────────────────────────
