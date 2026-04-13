@@ -342,18 +342,21 @@
   async function searchLinkedInTypeahead(query) {
     const results = [];
 
-    // Try LinkedIn's Voyager typeahead API
+    // Strategy 1: Use LinkedIn's Voyager typeahead API
     try {
-      // CSRF token from cookie — LinkedIn stores it with quotes
-      const cookieMatch = document.cookie.match(/JSESSIONID="?([^";]+)/);
-      const csrfToken = cookieMatch ? cookieMatch[1].replace(/"/g, '') : '';
+      // LinkedIn CSRF token is stored in JSESSIONID cookie with surrounding quotes
+      const allCookies = document.cookie;
+      let csrfToken = '';
+      const jsMatch = allCookies.match(/JSESSIONID=["']?([^;"']+)/);
+      if (jsMatch) csrfToken = jsMatch[1];
 
       if (csrfToken) {
         const resp = await fetch(
-          `https://www.linkedin.com/voyager/api/typeahead/hitsV2?keywords=${encodeURIComponent(query)}&origin=GLOBAL_SEARCH_HEADER&q=blended&types=List(PEOPLE,COMPANY)`,
+          `https://www.linkedin.com/voyager/api/search/dash/typeahead?decorationId=com.linkedin.voyager.dash.deco.search.SearchClusterCollection-175&keywords=${encodeURIComponent(query)}&q=type&type=PEOPLE`,
           {
             headers: {
               'csrf-token': csrfToken,
+              'x-li-lang': 'en_US',
               'x-restli-protocol-version': '2.0.0',
             },
             credentials: 'include',
@@ -362,24 +365,38 @@
 
         if (resp.ok) {
           const data = await resp.json();
-          // LinkedIn nests results in various places depending on API version
-          const elements = data?.included || data?.data?.elements || data?.elements || [];
-          for (const el of elements.slice(0, 10)) {
-            // Look for profile/company objects in the included array
-            const name = el?.title?.text
-              || el?.firstName && `${el.firstName} ${el.lastName || ''}`
-              || el?.name
-              || null;
-            const title = el?.headline?.text
-              || el?.subtext?.text
-              || el?.occupation
-              || el?.industry
-              || '';
-            const avatar = el?.picture?.rootUrl
-              || el?.image?.attributes?.[0]?.detailData?.nonEntityProfilePicture?.vectorImage?.rootUrl
-              || '';
-            if (name && name.length > 1 && name.length < 60) {
-              results.push({ name: name.trim(), title, avatar });
+          // Walk through the response to find people results
+          const included = data?.included || [];
+          const elements = data?.data?.elements || data?.elements || [];
+
+          // Build a map of URNs to profile data from included
+          const profileMap = {};
+          for (const item of included) {
+            if (item?.firstName || item?.title?.text) {
+              const name = item.firstName
+                ? `${item.firstName} ${item.lastName || ''}`.trim()
+                : item.title?.text;
+              if (name) {
+                const key = item.entityUrn || item['*miniProfile'] || name;
+                profileMap[key] = {
+                  name,
+                  title: item.occupation || item.headline?.text || item.subtext?.text || '',
+                  avatar: '',
+                };
+              }
+            }
+          }
+
+          // Use profiles from included, or parse elements directly
+          const profiles = Object.values(profileMap);
+          if (profiles.length) {
+            results.push(...profiles.slice(0, 8));
+          } else {
+            // Try parsing elements directly
+            for (const el of elements.slice(0, 8)) {
+              const name = el?.title?.text || el?.text?.text;
+              const title = el?.subtitle?.text || el?.subtext?.text || '';
+              if (name) results.push({ name, title, avatar: '' });
             }
           }
         }
@@ -388,40 +405,59 @@
       console.warn('[SpreadUp] LinkedIn typeahead API error:', err);
     }
 
-    // Fallback: scrape visible names from the current LinkedIn page
+    // Strategy 2: Try the older typeahead endpoint
     if (!results.length) {
       try {
-        // Try multiple selector patterns for LinkedIn's current DOM
-        const selectors = [
-          'span.feed-shared-actor__name',
-          'span.t-bold span[aria-hidden="true"]',
-          'span.t-bold',
-          '.feed-shared-actor__title span',
-          'a[data-control-name] span',
-          '.entity-result__title-text a span',
-        ];
-
-        const seen = new Set();
-        const queryLower = query.toLowerCase();
-
-        for (const sel of selectors) {
-          const els = [...shadowQueryAll(sel), ...document.querySelectorAll(sel)];
-          for (const el of els) {
-            const name = el.textContent?.trim();
-            if (name && name.length > 2 && name.length < 50
-                && !seen.has(name)
-                && name.toLowerCase().includes(queryLower)
-                && !/^\d/.test(name)          // skip numbers
-                && !/follow|like|comment|repost|view/i.test(name)) {  // skip action labels
-              seen.add(name);
-              results.push({ name, title: '', avatar: '' });
-              if (results.length >= 8) break;
+        const jsMatch = document.cookie.match(/JSESSIONID=["']?([^;"']+)/);
+        const csrfToken = jsMatch ? jsMatch[1] : '';
+        if (csrfToken) {
+          const resp = await fetch(
+            `https://www.linkedin.com/voyager/api/typeahead/hitsV2?keywords=${encodeURIComponent(query)}&origin=GLOBAL_SEARCH_HEADER&q=blended`,
+            {
+              headers: { 'csrf-token': csrfToken, 'x-restli-protocol-version': '2.0.0' },
+              credentials: 'include',
+            }
+          );
+          if (resp.ok) {
+            const data = await resp.json();
+            const hits = data?.included || data?.elements || [];
+            for (const h of hits.slice(0, 8)) {
+              const name = h?.title?.text || (h?.firstName ? `${h.firstName} ${h.lastName || ''}`.trim() : null);
+              if (name && name.length > 1) {
+                results.push({ name, title: h?.occupation || h?.headline?.text || '', avatar: '' });
+              }
             }
           }
+        }
+      } catch (_) {}
+    }
+
+    // Strategy 3: Scrape names visible on the current LinkedIn page
+    if (!results.length) {
+      const seen = new Set();
+      const qLow = query.toLowerCase();
+
+      // Collect all text nodes that look like person names
+      const allEls = [
+        ...shadowQueryAll('span[aria-hidden="true"]'),
+        ...shadowQueryAll('span.t-bold'),
+        ...shadowQueryAll('.feed-shared-actor__name'),
+        ...document.querySelectorAll('span[aria-hidden="true"]'),
+        ...document.querySelectorAll('span.t-bold'),
+        ...document.querySelectorAll('.feed-shared-actor__name'),
+      ];
+
+      for (const el of allEls) {
+        const name = el.textContent?.trim();
+        if (name && name.length > 2 && name.length < 50
+            && !seen.has(name)
+            && name.toLowerCase().includes(qLow)
+            && !/^\d/.test(name)
+            && !/follow|like|comment|repost|view|reply|see more|ago/i.test(name)) {
+          seen.add(name);
+          results.push({ name, title: '', avatar: '' });
           if (results.length >= 8) break;
         }
-      } catch (err) {
-        console.warn('[SpreadUp] LinkedIn scrape fallback error:', err);
       }
     }
 

@@ -166,31 +166,19 @@ function setupEditorEvents() {
     autosaveDraft();
   });
 
-  // Auto-format on paste: convert markdown + run smart format
-  editorArea.addEventListener('paste', (e) => {
-    // Get the pasted plain text directly from clipboard
-    const pasted = e.clipboardData?.getData('text/plain');
-    if (!pasted) return;
+  // Auto-format on paste: let text land, then convert markdown + smart format
+  editorArea.addEventListener('paste', () => {
+    // Save text before paste to detect what was added
+    const beforePaste = editorArea.value;
 
-    e.preventDefault(); // prevent default paste
-
-    // Convert any markdown in pasted text
-    const converted = convertMarkdown(pasted);
-
-    // Insert converted text at cursor position (or replace selection)
-    const start = editorArea.selectionStart;
-    const end = editorArea.selectionEnd;
-    const before = editorArea.value.slice(0, start);
-    const after = editorArea.value.slice(end);
-    editorArea.value = before + converted + after;
-
-    // Move cursor to end of pasted text
-    const newPos = start + converted.length;
-    editorArea.setSelectionRange(newPos, newPos);
-
-    // Sync state and run smart format on full text
-    state.editorText = editorArea.value;
-    smartFormat();
+    // Wait for the browser to finish inserting pasted text, then format
+    setTimeout(() => {
+      if (editorArea.value === beforePaste) return; // nothing changed
+      // Convert markdown in the full text
+      editorArea.value = convertMarkdown(editorArea.value);
+      state.editorText = editorArea.value;
+      smartFormat();
+    }, 150);
   });
 }
 
@@ -1060,15 +1048,14 @@ function renderMentionList(query) {
   } else if (q) {
     mentionList.innerHTML = `
       <div class="mention-item mention-selected" data-idx="-1">
-        <div class="mention-item-avatar">@</div>
+        <div class="mention-item-avatar" style="background:#1a1a2e;color:#F59E0B;font-weight:700">@</div>
         <div>
           <div class="mention-item-name">@${escapeHtml(q)}</div>
-          <div class="mention-item-sub">Press Enter or Tab to insert</div>
+          <div class="mention-item-sub">Enter to insert · searching LinkedIn…</div>
         </div>
-      </div>
-      ${q.length >= 2 ? '<div class="mention-tip">Searching LinkedIn…</div>' : '<div class="mention-tip">Type 2+ characters to search</div>'}`;
+      </div>`;
   } else {
-    mentionList.innerHTML = `<div class="mention-tip">Type a name to tag someone…</div>`;
+    mentionList.innerHTML = `<div class="mention-tip">Type a name…</div>`;
   }
 
   // Bind clicks
