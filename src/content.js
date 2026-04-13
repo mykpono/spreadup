@@ -348,135 +348,90 @@
     await delay(2000);
   }
 
-  // ─── LinkedIn typeahead search ─────────────────────────────────────────────
+  // ─── LinkedIn typeahead search (runs in PAGE context, not content script) ──
+  // Content scripts run in an isolated world and can't access LinkedIn's
+  // cookies/auth properly. We inject a <script> into the actual page that
+  // makes the API call with full access to LinkedIn's session.
 
-  async function searchLinkedInTypeahead(query) {
-    const results = [];
+  let pageSearchInjected = false;
 
-    // Strategy 1: Use LinkedIn's Voyager typeahead API
-    try {
-      // LinkedIn CSRF token is stored in JSESSIONID cookie with surrounding quotes
-      const allCookies = document.cookie;
-      let csrfToken = '';
-      const jsMatch = allCookies.match(/JSESSIONID=["']?([^;"']+)/);
-      if (jsMatch) csrfToken = jsMatch[1];
+  function injectPageSearchScript() {
+    if (pageSearchInjected) return;
+    pageSearchInjected = true;
 
-      if (csrfToken) {
-        const resp = await fetch(
-          `https://www.linkedin.com/voyager/api/search/dash/typeahead?decorationId=com.linkedin.voyager.dash.deco.search.SearchClusterCollection-175&keywords=${encodeURIComponent(query)}&q=type&type=PEOPLE`,
-          {
-            headers: {
-              'csrf-token': csrfToken,
-              'x-li-lang': 'en_US',
-              'x-restli-protocol-version': '2.0.0',
-            },
-            credentials: 'include',
-          }
-        );
+    const script = document.createElement('script');
+    script.textContent = `
+      (function() {
+        window.addEventListener('message', async function(e) {
+          if (e.data?.type !== '__SPREADUP_SEARCH__') return;
+          const query = e.data.query;
+          const results = [];
+          try {
+            const csrf = document.cookie.match(/JSESSIONID="?([^";]+)/)?.[1] || '';
+            if (!csrf) throw new Error('no csrf');
 
-        if (resp.ok) {
-          const data = await resp.json();
-          // Walk through the response to find people results
-          const included = data?.included || [];
-          const elements = data?.data?.elements || data?.elements || [];
-
-          // Build a map of URNs to profile data from included
-          const profileMap = {};
-          for (const item of included) {
-            if (item?.firstName || item?.title?.text) {
-              const name = item.firstName
-                ? `${item.firstName} ${item.lastName || ''}`.trim()
-                : item.title?.text;
-              if (name) {
-                const key = item.entityUrn || item['*miniProfile'] || name;
-                profileMap[key] = {
-                  name,
-                  title: item.occupation || item.headline?.text || item.subtext?.text || '',
-                  avatar: '',
-                };
+            const resp = await fetch(
+              'https://www.linkedin.com/voyager/api/typeahead/hitsV2?keywords='
+              + encodeURIComponent(query)
+              + '&origin=GLOBAL_SEARCH_HEADER&q=blended',
+              {
+                headers: {
+                  'csrf-token': csrf,
+                  'x-restli-protocol-version': '2.0.0',
+                },
+                credentials: 'include',
+              }
+            );
+            if (resp.ok) {
+              const data = await resp.json();
+              const items = data?.included || data?.elements || [];
+              const seen = new Set();
+              for (const item of items) {
+                let name = null, title = '';
+                if (item.firstName) {
+                  name = (item.firstName + ' ' + (item.lastName || '')).trim();
+                  title = item.occupation || '';
+                } else if (item.title && item.title.text) {
+                  name = item.title.text;
+                  title = item.subtext?.text || item.headline?.text || '';
+                }
+                if (name && name.length > 1 && name.length < 60 && !seen.has(name)) {
+                  seen.add(name);
+                  results.push({ name: name, title: title });
+                }
+                if (results.length >= 7) break;
               }
             }
+          } catch(err) {
+            console.warn('[SpreadUp] page search error:', err);
           }
-
-          // Use profiles from included, or parse elements directly
-          const profiles = Object.values(profileMap);
-          if (profiles.length) {
-            results.push(...profiles.slice(0, 8));
-          } else {
-            // Try parsing elements directly
-            for (const el of elements.slice(0, 8)) {
-              const name = el?.title?.text || el?.text?.text;
-              const title = el?.subtitle?.text || el?.subtext?.text || '';
-              if (name) results.push({ name, title, avatar: '' });
-            }
-          }
-        }
-      }
-    } catch (err) {
-      console.warn('[SpreadUp] LinkedIn typeahead API error:', err);
-    }
-
-    // Strategy 2: Try the older typeahead endpoint
-    if (!results.length) {
-      try {
-        const jsMatch = document.cookie.match(/JSESSIONID=["']?([^;"']+)/);
-        const csrfToken = jsMatch ? jsMatch[1] : '';
-        if (csrfToken) {
-          const resp = await fetch(
-            `https://www.linkedin.com/voyager/api/typeahead/hitsV2?keywords=${encodeURIComponent(query)}&origin=GLOBAL_SEARCH_HEADER&q=blended`,
-            {
-              headers: { 'csrf-token': csrfToken, 'x-restli-protocol-version': '2.0.0' },
-              credentials: 'include',
-            }
-          );
-          if (resp.ok) {
-            const data = await resp.json();
-            const hits = data?.included || data?.elements || [];
-            for (const h of hits.slice(0, 8)) {
-              const name = h?.title?.text || (h?.firstName ? `${h.firstName} ${h.lastName || ''}`.trim() : null);
-              if (name && name.length > 1) {
-                results.push({ name, title: h?.occupation || h?.headline?.text || '', avatar: '' });
-              }
-            }
-          }
-        }
-      } catch (_) {}
-    }
-
-    // Strategy 3: Scrape names visible on the current LinkedIn page
-    if (!results.length) {
-      const seen = new Set();
-      const qLow = query.toLowerCase();
-
-      // Collect all text nodes that look like person names
-      const allEls = [
-        ...shadowQueryAll('span[aria-hidden="true"]'),
-        ...shadowQueryAll('span.t-bold'),
-        ...shadowQueryAll('.feed-shared-actor__name'),
-        ...document.querySelectorAll('span[aria-hidden="true"]'),
-        ...document.querySelectorAll('span.t-bold'),
-        ...document.querySelectorAll('.feed-shared-actor__name'),
-      ];
-
-      for (const el of allEls) {
-        const name = el.textContent?.trim();
-        if (name && name.length > 2 && name.length < 50
-            && !seen.has(name)
-            && name.toLowerCase().includes(qLow)
-            && !/^\d/.test(name)
-            && !/follow|like|comment|repost|view|reply|see more|ago/i.test(name)) {
-          seen.add(name);
-          results.push({ name, title: '', avatar: '' });
-          if (results.length >= 8) break;
-        }
-      }
-    }
-
-    panelFrame?.contentWindow?.postMessage({
-      type: 'LINKEDIN_SEARCH_RESULTS',
-      results,
-    }, '*');
+          window.postMessage({
+            type: '__SPREADUP_SEARCH_RESULTS__',
+            results: results,
+            query: query
+          }, '*');
+        });
+      })();
+    `;
+    document.documentElement.appendChild(script);
+    script.remove(); // script runs immediately, element no longer needed
   }
+
+  function searchLinkedInTypeahead(query) {
+    injectPageSearchScript();
+    window.postMessage({ type: '__SPREADUP_SEARCH__', query }, '*');
+  }
+
+  // Listen for results from the injected page script and forward to panel
+  window.addEventListener('message', (e) => {
+    if (e.data?.type === '__SPREADUP_SEARCH_RESULTS__') {
+      panelFrame?.contentWindow?.postMessage({
+        type: 'LINKEDIN_SEARCH_RESULTS',
+        results: e.data.results || [],
+        query: e.data.query,
+      }, '*');
+    }
+  });
 
   // ─── Message handler (from panel iframe) ─────────────────────────────────────
 

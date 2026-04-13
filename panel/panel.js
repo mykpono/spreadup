@@ -919,11 +919,15 @@ async function setupAnthropicKey() {
   });
 }
 
-// ─── @ Mention (simple inline insertion) ─────────────────────────────────────
-// Type @ in the editor → dropdown appears → type name → Enter to insert @Name.
+// ─── @ Mention with LinkedIn search ──────────────────────────────────────────
+// Type @ → dropdown appears → type name → LinkedIn results show in real time
+// → click or Enter/ArrowDown to select → inserts @Name
 
-let mentionActive = false;
-let mentionAtPos  = -1;
+let mentionActive   = false;
+let mentionAtPos    = -1;
+let mentionResults  = [];
+let mentionSelected = -1; // -1 = manual insert row, 0+ = search results
+let mentionTimer    = null;
 
 const mentionDropdown = $('#mention-dropdown');
 const mentionList     = $('#mention-list');
@@ -940,15 +944,20 @@ function getMentionQuery() {
 function openMention() {
   mentionActive = true;
   mentionAtPos = editorArea.selectionStart - 1;
+  mentionResults = [];
+  mentionSelected = -1;
   positionDropdown();
-  updateMentionUI('');
+  renderMentionDropdown('');
   mentionDropdown.classList.remove('hidden');
 }
 
 function closeMention() {
   mentionActive = false;
   mentionAtPos = -1;
+  mentionResults = [];
+  mentionSelected = -1;
   mentionDropdown.classList.add('hidden');
+  clearTimeout(mentionTimer);
 }
 
 function positionDropdown() {
@@ -957,9 +966,9 @@ function positionDropdown() {
   const lineCount = textBefore.split('\n').length;
   const cursorY = Math.min(lineCount * 20, rect.height - 40);
   mentionDropdown.style.position = 'absolute';
-  mentionDropdown.style.left = `${rect.left + 16}px`;
+  mentionDropdown.style.left = `${rect.left + 12}px`;
   mentionDropdown.style.top = `${rect.top + cursorY + 24}px`;
-  mentionDropdown.style.width = `${Math.min(rect.width - 32, 280)}px`;
+  mentionDropdown.style.width = `${Math.min(rect.width - 24, 320)}px`;
 }
 
 function insertMention(name) {
@@ -974,43 +983,125 @@ function insertMention(name) {
   editorArea.focus();
 }
 
-function updateMentionUI(q) {
+function renderMentionDropdown(q) {
+  let html = '';
+
+  // Search results (from LinkedIn)
+  if (mentionResults.length) {
+    html += mentionResults.map((r, i) => `
+      <div class="mention-item${i === mentionSelected ? ' mention-selected' : ''}" data-idx="${i}">
+        <div class="mention-item-avatar">${escapeHtml((r.name || '?')[0]).toUpperCase()}</div>
+        <div>
+          <div class="mention-item-name">${escapeHtml(r.name)}</div>
+          ${r.title ? `<div class="mention-item-sub">${escapeHtml(r.title)}</div>` : ''}
+        </div>
+      </div>`).join('');
+  }
+
+  // Always show manual insert option at bottom when there's a query
   if (q) {
-    mentionList.innerHTML = `
-      <div class="mention-item mention-selected" id="mention-insert">
-        <div class="mention-item-avatar" style="background:#1a1a2e;color:#F59E0B;font-weight:700">@</div>
+    const isManualSelected = mentionSelected === -1 && !mentionResults.length
+                          || mentionSelected === mentionResults.length;
+    html += `
+      <div class="mention-item${isManualSelected ? ' mention-selected' : ''}" data-idx="-1">
+        <div class="mention-item-avatar" style="background:#1a1a2e;color:#F59E0B;font-weight:700;font-size:13px">@</div>
         <div>
           <div class="mention-item-name">@${escapeHtml(q)}</div>
-          <div class="mention-item-sub">Enter to insert</div>
+          <div class="mention-item-sub">Enter to insert as text</div>
         </div>
       </div>`;
-    $('#mention-insert')?.addEventListener('click', () => insertMention(q));
-  } else {
-    mentionList.innerHTML = `<div class="mention-tip">Type a name…</div>`;
   }
+
+  if (!html) {
+    html = '<div class="mention-tip">Type a name…</div>';
+  }
+
+  mentionList.innerHTML = html;
+
+  // Bind clicks
+  $$('.mention-item[data-idx]', mentionList).forEach((el) => {
+    el.addEventListener('click', () => {
+      const idx = parseInt(el.dataset.idx);
+      if (idx >= 0 && mentionResults[idx]) {
+        insertMention(mentionResults[idx].name);
+      } else {
+        insertMention(q);
+      }
+    });
+  });
 }
 
-// Track @ typing
+function triggerSearch(query) {
+  clearTimeout(mentionTimer);
+  if (!query || query.length < 1) return;
+
+  // Debounce 150ms for near real-time feel
+  mentionTimer = setTimeout(() => {
+    window.parent.postMessage({ type: 'SEARCH_LINKEDIN', payload: { query } }, '*');
+  }, 150);
+}
+
+// Track @ typing in editor
 editorArea.addEventListener('input', () => {
   if (!mentionActive) return;
   const q = getMentionQuery();
   if (editorArea.selectionStart <= mentionAtPos || q.includes(' ') || q.includes('\n')) {
     closeMention(); return;
   }
-  updateMentionUI(q);
+  // Reset selection when query changes
+  mentionSelected = mentionResults.length ? 0 : -1;
+  renderMentionDropdown(q);
+  triggerSearch(q);
 });
 
 editorArea.addEventListener('keydown', (e) => {
+  // Open mention on @
   if (e.key === '@' && !mentionActive) {
     setTimeout(() => openMention(), 0);
     return;
   }
   if (!mentionActive) return;
-  if (e.key === 'Escape') { e.preventDefault(); closeMention(); return; }
+
+  const totalItems = mentionResults.length + 1; // results + manual insert
+
+  if (e.key === 'Escape') {
+    e.preventDefault(); closeMention(); return;
+  }
+
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    mentionSelected = Math.min(mentionSelected + 1, totalItems - 1);
+    renderMentionDropdown(getMentionQuery());
+    return;
+  }
+
+  if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    mentionSelected = Math.max(mentionSelected - 1, 0);
+    renderMentionDropdown(getMentionQuery());
+    return;
+  }
+
   if (e.key === 'Enter' || e.key === 'Tab') {
-    const q = getMentionQuery().trim();
-    if (q) { e.preventDefault(); insertMention(q); }
-    else closeMention();
+    e.preventDefault();
+    if (mentionSelected >= 0 && mentionSelected < mentionResults.length) {
+      insertMention(mentionResults[mentionSelected].name);
+    } else {
+      const q = getMentionQuery().trim();
+      if (q) insertMention(q);
+      else closeMention();
+    }
+    return;
+  }
+});
+
+// Receive LinkedIn search results from content script
+window.addEventListener('message', (e) => {
+  if (e.source !== window.parent) return;
+  if (e.data?.type === 'LINKEDIN_SEARCH_RESULTS' && mentionActive) {
+    mentionResults = (e.data.results || []).slice(0, 7);
+    if (mentionResults.length) mentionSelected = 0;
+    renderMentionDropdown(getMentionQuery());
   }
 });
 
