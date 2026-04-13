@@ -312,8 +312,8 @@ html, body {
   background: var(--yellow-light);
 }
 .mention-item-avatar {
-  width: 28px;
-  height: 28px;
+  width: 32px;
+  height: 32px;
   border-radius: 50%;
   background: linear-gradient(135deg, var(--yellow), var(--yellow-dark));
   display: flex;
@@ -324,8 +324,15 @@ html, body {
   color: #fff;
   flex-shrink: 0;
 }
+.mention-item-img {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex-shrink: 0;
+}
 .mention-item-name { font-weight: 500; color: var(--text-primary); }
-.mention-item-sub  { font-size: var(--text-xs); color: var(--text-muted); }
+.mention-item-sub  { font-size: var(--text-xs); color: var(--text-muted); max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* ─── Emoji picker ──────────────────────────────────────────────────────────── */
 .emoji-picker {

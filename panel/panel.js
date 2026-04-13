@@ -998,14 +998,19 @@ function renderMentionDropdown(q) {
 
   // Search results (from LinkedIn)
   if (mentionResults.length) {
-    html += mentionResults.map((r, i) => `
+    html += mentionResults.map((r, i) => {
+      const avatarHtml = r.avatar
+        ? `<img class="mention-item-img" src="${escapeHtml(r.avatar)}" alt="" />`
+        : `<div class="mention-item-avatar">${escapeHtml((r.name || '?')[0]).toUpperCase()}</div>`;
+      return `
       <div class="mention-item${i === mentionSelected ? ' mention-selected' : ''}" data-idx="${i}">
-        <div class="mention-item-avatar">${escapeHtml((r.name || '?')[0]).toUpperCase()}</div>
+        ${avatarHtml}
         <div>
           <div class="mention-item-name">${escapeHtml(r.name)}</div>
           ${r.title ? `<div class="mention-item-sub">${escapeHtml(r.title)}</div>` : ''}
         </div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
   }
 
   // Always show manual insert option at bottom when there's a query
@@ -1045,10 +1050,12 @@ function triggerSearch(query) {
   clearTimeout(mentionTimer);
   if (!query || query.length < 1) return;
 
-  // Debounce 300ms — content script types into LinkedIn's search bar and scrapes results
+  // Debounce 400ms — content script scrapes LinkedIn search in the background
   mentionTimer = setTimeout(() => {
+    // Show searching indicator
+    mentionList.innerHTML = '<div class="mention-tip">Searching LinkedIn…</div>';
     window.parent.postMessage({ type: 'SEARCH_LINKEDIN', payload: { query } }, '*');
-  }, 300);
+  }, 400);
 }
 
 // Track @ typing in editor

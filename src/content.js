@@ -63,8 +63,7 @@
     `;
     panelFrame.setAttribute('allow', 'clipboard-write');
     document.body.appendChild(panelFrame);
-
-    window.addEventListener('message', handlePanelMessage);
+    // Message listener is already added in init()
   }
 
   function showPanel() {
@@ -370,8 +369,29 @@
   // LinkedIn's old Voyager REST APIs are gone (404). The new RSC/SDUI endpoints
   // are session-coupled and can't be called programmatically. Instead, we type
   // into LinkedIn's own search bar, scrape the dropdown results, then clear it.
+  // A CSS overlay hides the entire search UI so the user sees nothing.
 
   let searchInProgress = false;
+  let searchHideStyle = null;
+
+  function hideLinkedInSearch() {
+    if (searchHideStyle) return;
+    searchHideStyle = document.createElement('style');
+    searchHideStyle.textContent = `
+      [role="listbox"], [role="combobox"] + *, .search-global-typeahead__overlay {
+        opacity: 0 !important;
+        pointer-events: none !important;
+      }
+    `;
+    document.head.appendChild(searchHideStyle);
+  }
+
+  function showLinkedInSearch() {
+    if (searchHideStyle) {
+      searchHideStyle.remove();
+      searchHideStyle = null;
+    }
+  }
 
   async function searchLinkedInPeople(query) {
     if (searchInProgress || !query || query.length < 1) return;
@@ -385,9 +405,8 @@
 
       const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
 
-      // Hide LinkedIn's search dropdown so user doesn't see it flash
-      const searchContainer = input.closest('[class*="search"]') || input.parentElement?.parentElement;
-      let dropdownEl = null;
+      // Hide LinkedIn's search dropdown BEFORE we start typing
+      hideLinkedInSearch();
 
       // Clear any existing search
       setter.call(input, '');
@@ -411,13 +430,6 @@
           return text.includes('•') && !text.includes('recent entity history');
         });
 
-        // Hide the dropdown as soon as we detect it (so user doesn't see it)
-        if (!dropdownEl) {
-          dropdownEl = document.querySelector('[role="listbox"]')
-            || shadowQuery('[role="listbox"]');
-          if (dropdownEl) dropdownEl.style.opacity = '0';
-        }
-
         if (realResults.length > 0) {
           results = realResults
             .map((o) => {
@@ -426,7 +438,10 @@
               const name = parts[0] || '';
               const title = parts.slice(2).join(' · ').substring(0, 80)
                 || parts[1] || '';
-              return { name, title };
+              // Grab profile image
+              const img = o.querySelector('img');
+              const avatar = img?.src || '';
+              return { name, title, avatar };
             })
             .filter((r) => r.name && r.name.length > 1 && r.name.length < 50
               && r.name.toLowerCase() !== 'see all results'
@@ -439,7 +454,7 @@
       setter.call(input, '');
       input.dispatchEvent(new Event('input', { bubbles: true }));
       input.blur();
-      if (dropdownEl) dropdownEl.style.opacity = '';
+      showLinkedInSearch();
 
       panelFrame?.contentWindow?.postMessage({
         type: 'LINKEDIN_SEARCH_RESULTS',
@@ -448,6 +463,7 @@
       }, '*');
     } catch (err) {
       console.warn('[SpreadUp] search error:', err);
+      showLinkedInSearch();
     } finally {
       searchInProgress = false;
     }
@@ -504,6 +520,17 @@
 
   function init() {
     injectTriggerButton();
+
+    // Always listen for panel messages (needed after extension reload when
+    // the panel iframe already exists but createPanel() hasn't been called)
+    window.addEventListener('message', handlePanelMessage);
+
+    // Reconnect to existing panel iframe (e.g. after extension reload)
+    const existing = document.getElementById('spreadup-panel');
+    if (existing) {
+      panelFrame = existing;
+      panelVisible = existing.style.display !== 'none';
+    }
   }
 
   if (document.readyState === 'loading') {
