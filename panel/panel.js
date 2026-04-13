@@ -1061,11 +1061,18 @@ function triggerSearch(query) {
   clearTimeout(mentionTimer);
   if (!query || query.length < 1) return;
 
-  // Debounce 400ms — content script scrapes LinkedIn search in the background
+  // Debounce 400ms — background service worker calls Voyager API directly
   mentionTimer = setTimeout(() => {
     // Show searching indicator
     mentionList.innerHTML = '<div class="mention-tip">Searching LinkedIn…</div>';
-    chrome.runtime.sendMessage({ type: 'SEARCH_LINKEDIN', payload: { query } });
+    chrome.runtime.sendMessage({ type: 'SEARCH_LINKEDIN', payload: { query } }, (response) => {
+      // Results come back directly via sendResponse (no broadcast needed)
+      if (response?.type === 'LINKEDIN_SEARCH_RESULTS' && mentionActive) {
+        mentionResults = (response.results || []).slice(0, 7);
+        if (mentionResults.length) mentionSelected = 0;
+        renderMentionDropdown(getMentionQuery());
+      }
+    });
   }, 400);
 }
 
@@ -1123,16 +1130,8 @@ editorArea.addEventListener('keydown', (e) => {
   }
 });
 
-// Receive LinkedIn search results from content script (via chrome.runtime relay)
-// Note: This listener is merged into the main chrome.runtime.onMessage listener
-// added in setupActions(). We add a second one here for the mention-specific flow.
-chrome.runtime.onMessage.addListener((msg) => {
-  if (msg?.type === 'LINKEDIN_SEARCH_RESULTS' && mentionActive) {
-    mentionResults = (msg.results || []).slice(0, 7);
-    if (mentionResults.length) mentionSelected = 0;
-    renderMentionDropdown(getMentionQuery());
-  }
-});
+// Search results now arrive via sendMessage callback (not broadcast).
+// No separate onMessage listener needed for LINKEDIN_SEARCH_RESULTS.
 
 // ─── File / image attachments ────────────────────────────────────────────────
 

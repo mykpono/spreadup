@@ -264,14 +264,13 @@ async function getLinkedInCookies() {
 }
 
 async function searchLinkedInPeople(query) {
-  if (!query) return { results: [], query };
+  if (!query) return { type: 'LINKEDIN_SEARCH_RESULTS', results: [], query };
 
   try {
     const { csrf, cookieHeader } = await getLinkedInCookies();
     if (!csrf) {
       console.warn('[SpreadUp] No JSESSIONID cookie — user may not be logged into LinkedIn');
-      chrome.runtime.sendMessage({ type: 'LINKEDIN_SEARCH_RESULTS', results: [], query });
-      return { ok: true };
+      return { type: 'LINKEDIN_SEARCH_RESULTS', results: [], query };
     }
 
     const params = new URLSearchParams({
@@ -293,8 +292,7 @@ async function searchLinkedInPeople(query) {
 
     if (!res.ok) {
       console.warn(`[SpreadUp] Voyager search returned ${res.status}`);
-      chrome.runtime.sendMessage({ type: 'LINKEDIN_SEARCH_RESULTS', results: [], query });
-      return { ok: true };
+      return { type: 'LINKEDIN_SEARCH_RESULTS', results: [], query };
     }
 
     const json = await res.json();
@@ -325,12 +323,10 @@ async function searchLinkedInPeople(query) {
       .filter((r) => r.name && r.name.length > 1 && r.name.length < 60)
       .slice(0, 7);
 
-    chrome.runtime.sendMessage({ type: 'LINKEDIN_SEARCH_RESULTS', results, query });
-    return { ok: true };
+    return { type: 'LINKEDIN_SEARCH_RESULTS', results, query };
   } catch (err) {
     console.warn('[SpreadUp] search error:', err);
-    chrome.runtime.sendMessage({ type: 'LINKEDIN_SEARCH_RESULTS', results: [], query });
-    return { ok: true };
+    return { type: 'LINKEDIN_SEARCH_RESULTS', results: [], query };
   }
 }
 
