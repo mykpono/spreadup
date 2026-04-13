@@ -359,85 +359,11 @@
     await delay(2000);
   }
 
-  // ─── LinkedIn typeahead search ──────────────────────────────────────────────
-  // Content script runs on linkedin.com so fetch with credentials: 'include'
-  // automatically sends LinkedIn's session cookies. We get the CSRF token
-  // from document.cookie (JSESSIONID is not httpOnly on LinkedIn).
-  // Falls back to background script if content script fetch fails.
-
-  async function searchLinkedInTypeahead(query) {
-    let results = [];
-
-    try {
-      // Try content script direct fetch first (same-origin, cookies included)
-      const csrf = document.cookie.match(/JSESSIONID="?([^";]+)/)?.[1] || '';
-
-      if (csrf) {
-        const resp = await fetch(
-          `https://www.linkedin.com/voyager/api/typeahead/hitsV2?keywords=${encodeURIComponent(query)}&origin=GLOBAL_SEARCH_HEADER&q=blended`,
-          {
-            headers: {
-              'csrf-token': csrf,
-              'x-restli-protocol-version': '2.0.0',
-            },
-            credentials: 'include',
-          }
-        );
-
-        if (resp.ok) {
-          const data = await resp.json();
-          results = parseTypeaheadResults(data);
-        }
-      }
-
-      // Fallback: ask background script (uses chrome.cookies API)
-      if (!results.length) {
-        const bgResp = await new Promise((resolve) => {
-          chrome.runtime.sendMessage({ type: 'SEARCH_LINKEDIN', payload: { query } }, resolve);
-        });
-        results = bgResp?.results || [];
-      }
-    } catch (err) {
-      console.warn('[SpreadUp] search error:', err);
-      // Last resort fallback to background
-      try {
-        const bgResp = await new Promise((resolve) => {
-          chrome.runtime.sendMessage({ type: 'SEARCH_LINKEDIN', payload: { query } }, resolve);
-        });
-        results = bgResp?.results || [];
-      } catch (_) {}
-    }
-
-    panelFrame?.contentWindow?.postMessage({
-      type: 'LINKEDIN_SEARCH_RESULTS',
-      results,
-      query,
-    }, '*');
-  }
-
-  function parseTypeaheadResults(data) {
-    const items = data?.included || data?.elements || [];
-    const results = [];
-    const seen = new Set();
-    for (const item of items) {
-      let name = null, title = '';
-      if (item.firstName) {
-        name = `${item.firstName} ${item.lastName || ''}`.trim();
-        title = item.occupation || '';
-      } else if (item.title?.text) {
-        name = item.title.text;
-        title = item.subtext?.text || item.headline?.text || '';
-      }
-      if (name && name.length > 1 && name.length < 60 && !seen.has(name) && !/^urn:/.test(name)) {
-        seen.add(name);
-        results.push({ name, title });
-      }
-      if (results.length >= 7) break;
-    }
-    return results;
-  }
-
   // ─── Message handler (from panel iframe) ─────────────────────────────────────
+  // Note: LinkedIn search is handled by the panel calling the background script
+  // directly via chrome.runtime.sendMessage. The background uses
+  // chrome.scripting.executeScript with world:'MAIN' to run the search in
+  // LinkedIn's page context (full cookie/session access).
 
   function handlePanelMessage(event) {
     if (event.source !== panelFrame?.contentWindow) return;
@@ -465,9 +391,6 @@
       }
       case 'PUBLISH_POST':
         handlePublish(payload.text, payload.attachments || []);
-        break;
-      case 'SEARCH_LINKEDIN':
-        searchLinkedInTypeahead(payload.query);
         break;
       default:
         break;
