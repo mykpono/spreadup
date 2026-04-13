@@ -977,7 +977,7 @@ function positionDropdown() {
   const textBefore = editorArea.value.slice(0, editorArea.selectionStart);
   const lineCount = textBefore.split('\n').length;
   const cursorY = Math.min(lineCount * 20, rect.height - 40);
-  mentionDropdown.style.position = 'absolute';
+  // Keep CSS position: fixed — getBoundingClientRect() returns viewport coords
   mentionDropdown.style.left = `${rect.left + 12}px`;
   mentionDropdown.style.top = `${rect.top + cursorY + 24}px`;
   mentionDropdown.style.width = `${Math.min(rect.width - 24, 320)}px`;

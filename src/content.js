@@ -140,25 +140,35 @@
   function insertTextIntoEditor(editor, text) {
     editor.focus();
 
+    // LinkedIn's editor lives inside a Shadow DOM — window.getSelection() won't
+    // see it. Use the shadow root's getSelection() when available (Chrome 53+).
+    const root = editor.getRootNode();
+    const sel = (root instanceof ShadowRoot && typeof root.getSelection === 'function')
+      ? root.getSelection()
+      : window.getSelection();
+
     const range = document.createRange();
     range.selectNodeContents(editor);
-    const sel = window.getSelection();
     sel.removeAllRanges();
     sel.addRange(range);
 
     const ok = document.execCommand('insertText', false, text);
 
     if (!ok) {
-      editor.innerText = text;
+      // Fallback: set the first <p> content and fire input so Quill picks it up
+      const p = editor.querySelector('p') || editor;
+      p.textContent = text;
+      editor.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true }));
+    } else {
+      editor.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data: text }));
     }
-
-    editor.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, data: text }));
   }
 
   // ─── LinkedIn profile scraping ────────────────────────────────────────────────
 
   function getLinkedInProfile() {
-    const ownImg = [...document.querySelectorAll('img')].find((i) =>
+    // LinkedIn's UI is inside a Shadow DOM — document.querySelectorAll won't find it
+    const ownImg = shadowQueryAll('img').find((i) =>
       i.src?.includes('profile-displayphoto') &&
       i.alt && i.alt.length > 0 &&
       !i.alt.startsWith('View ')
@@ -421,107 +431,168 @@
     await delay(2000);
   }
 
-  // ─── LinkedIn people search via DOM scraping ─────────────────────────────────
-  // LinkedIn's old Voyager REST APIs are gone (404). The new RSC/SDUI endpoints
-  // are session-coupled and can't be called programmatically. Instead, we type
-  // into LinkedIn's own search bar, scrape the dropdown results, then clear it.
-  // A CSS overlay hides the entire search UI so the user sees nothing.
+  // ─── LinkedIn people search via Voyager API (fully background, no DOM touching) ─
+  // Calls LinkedIn's own typeahead endpoint — the same one powering its search bar.
+  // Because the content script runs on linkedin.com, fetch() automatically includes
+  // the session cookies, so no login handling is needed. The CSRF token lives in
+  // the JSESSIONID cookie (quotes stripped). Falls back to DOM scraping only if
+  // the API returns a non-2xx or the response is unparseable.
 
   let searchInProgress = false;
-  let searchHideStyle = null;
 
-  function hideLinkedInSearch() {
-    if (searchHideStyle) return;
-    searchHideStyle = document.createElement('style');
-    searchHideStyle.textContent = `
-      [role="listbox"], [role="combobox"] + *, .search-global-typeahead__overlay {
-        opacity: 0 !important;
-        pointer-events: none !important;
-      }
-    `;
-    document.head.appendChild(searchHideStyle);
+  // ── Parse CSRF token LinkedIn stores in the JSESSIONID cookie ────────────────
+  function getLinkedInCsrf() {
+    return document.cookie
+      .split(';')
+      .map((c) => c.trim())
+      .find((c) => c.startsWith('JSESSIONID='))
+      ?.split('=').slice(1).join('=')
+      ?.replace(/^"|"$/g, '') || null;
   }
 
-  function showLinkedInSearch() {
-    if (searchHideStyle) {
-      searchHideStyle.remove();
-      searchHideStyle = null;
+  // ── Call the Voyager typeahead endpoint (returns null on any failure) ─────────
+  async function searchViaApi(query) {
+    const csrf = getLinkedInCsrf();
+    if (!csrf) return null;
+
+    const params = new URLSearchParams({
+      keywords: query,
+      origin:   'OTHER',
+      q:        'type',
+      type:     'PEOPLE',
+    });
+
+    let res;
+    try {
+      res = await fetch(`/voyager/api/typeahead/hitsV2?${params}`, {
+        credentials: 'include',
+        headers: {
+          'csrf-token':                  csrf,
+          'x-restli-protocol-version':   '2.0.0',
+          'x-li-lang':                   'en_US',
+          'accept':                      'application/vnd.linkedin.normalized+json+2.1',
+        },
+      });
+    } catch (_) {
+      return null;
     }
+
+    if (!res.ok) return null;
+
+    let json;
+    try { json = await res.json(); } catch (_) { return null; }
+
+    // Response shape differs across LinkedIn versions — handle both
+    const elements = json?.data?.elements ?? json?.elements ?? [];
+
+    return elements
+      .map((el) => {
+        // The hit object is nested under a type-keyed property
+        const hit = el.hitInfo
+          ? Object.values(el.hitInfo)[0]
+          : el;
+
+        const name   = hit?.text?.text   ?? hit?.name     ?? '';
+        const title  = hit?.subtext?.text ?? hit?.headline ?? '';
+
+        // Avatar: LinkedIn stores images as relative path segments
+        const artifact =
+          hit?.image?.attributes?.[0]?.detailData
+            ?.['com.linkedin.voyager.dash.common.image.ImageViewModel']
+            ?.artifacts?.[0]
+          ?? hit?.image?.attributes?.[0]?.detailData
+            ?.['com.linkedin.voyager.common.image.ImageViewModel']
+            ?.artifacts?.[0];
+
+        const avatar = artifact?.fileIdentifyingUrlPathSegment
+          ? `https://media.licdn.com/dms/image/${artifact.fileIdentifyingUrlPathSegment}`
+          : (hit?.image?.rootUrl
+              ? hit.image.rootUrl + (artifact?.fileIdentifyingUrlPathSegment ?? '')
+              : '');
+
+        return { name, title, avatar };
+      })
+      .filter((r) => r.name && r.name.length > 1 && r.name.length < 60);
   }
 
-  async function searchLinkedInPeople(query) {
-    if (searchInProgress || !query || query.length < 1) return;
-    searchInProgress = true;
+  // ── Fallback: scrape LinkedIn's own search-bar dropdown (last resort) ─────────
+  async function searchViaDom(query) {
+    const input =
+      document.querySelector('input[placeholder*="looking for"]') ||
+      document.querySelector('input.search-global-typeahead__input') ||
+      shadowQuery('input[placeholder*="looking for"]') ||
+      shadowQuery('input[placeholder*="Search"]') ||
+      shadowQuery('input[role="combobox"]') ||
+      document.querySelector('input[role="combobox"]');
+
+    if (!input) return [];
+
+    // Hide the dropdown so it doesn't flash on screen
+    const hideStyle = document.createElement('style');
+    hideStyle.textContent = `
+      [role="listbox"], [role="combobox"] + *,
+      .search-global-typeahead__overlay { opacity:0!important; pointer-events:none!important; }
+    `;
+    document.head.appendChild(hideStyle);
 
     try {
-      // LinkedIn's search bar — try multiple selectors for different UI versions
-      const input = document.querySelector('input[placeholder*="looking for"]')
-        || document.querySelector('input.search-global-typeahead__input')
-        || shadowQuery('input[placeholder*="looking for"]')
-        || shadowQuery('input[placeholder*="Search"]')
-        || shadowQuery('input[role="combobox"]')
-        || document.querySelector('input[role="combobox"]');
-      if (!input) {
-        // Send empty results back so panel doesn't hang on "Searching…"
-        chrome.runtime.sendMessage({ type: 'LINKEDIN_SEARCH_RESULTS', results: [], query });
-        searchInProgress = false;
-        return;
-      }
-
       const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-
-      // Hide LinkedIn's search dropdown BEFORE we start typing
-      hideLinkedInSearch();
-
-      // Clear any existing search
       setter.call(input, '');
       input.dispatchEvent(new Event('input', { bubbles: true }));
-      await delay(100);
+      await delay(80);
 
-      // Type the query
       input.focus();
       setter.call(input, query);
       input.dispatchEvent(new Event('input', { bubbles: true }));
 
-      // Wait for REAL search results (not history items) to appear (poll up to 2.5s)
       let results = [];
-      const start = Date.now();
-      while (Date.now() - start < 2500) {
+      const deadline = Date.now() + 2500;
+      while (Date.now() < deadline) {
         await delay(250);
-        const options = [...document.querySelectorAll('[role="option"]'),
-                         ...shadowQueryAll('[role="option"]')];
-        const realResults = options.filter((o) => {
-          const text = o.textContent?.trim() || '';
-          return text.includes('•') && !text.includes('recent entity history');
+        const options = [
+          ...document.querySelectorAll('[role="option"]'),
+          ...shadowQueryAll('[role="option"]'),
+        ];
+        const real = options.filter((o) => {
+          const t = o.textContent?.trim() || '';
+          return t.includes('•') && !t.includes('recent entity history');
         });
-
-        if (realResults.length > 0) {
-          results = realResults
+        if (real.length) {
+          results = real
             .map((o) => {
-              const text = o.textContent?.trim() || '';
-              const parts = text.split('•').map((s) => s.trim());
-              const name = parts[0] || '';
-              const title = parts.slice(2).join(' · ').substring(0, 80)
-                || parts[1] || '';
-              // Grab profile image
-              const img = o.querySelector('img');
-              const avatar = img?.src || '';
-              return { name, title, avatar };
+              const parts = (o.textContent?.trim() || '').split('•').map((s) => s.trim());
+              return {
+                name:   parts[0] || '',
+                title:  parts.slice(2).join(' · ').substring(0, 80) || parts[1] || '',
+                avatar: o.querySelector('img')?.src || '',
+              };
             })
-            .filter((r) => r.name && r.name.length > 1 && r.name.length < 50
-              && r.name.toLowerCase() !== 'see all results'
-              && r.name.toLowerCase() !== 'show all');
+            .filter((r) => r.name.length > 1 && r.name.length < 50 &&
+              !['see all results', 'show all'].includes(r.name.toLowerCase()));
           break;
         }
       }
 
-      // Clear search and restore visibility
       setter.call(input, '');
       input.dispatchEvent(new Event('input', { bubbles: true }));
       input.blur();
-      showLinkedInSearch();
+      return results;
+    } finally {
+      hideStyle.remove();
+    }
+  }
 
-      // Send results back to panel via chrome.runtime (panel listens on onMessage)
+  // ── Public entry point ────────────────────────────────────────────────────────
+  async function searchLinkedInPeople(query) {
+    if (searchInProgress || !query) return;
+    searchInProgress = true;
+    try {
+      // Try the invisible API route first; fall back to DOM scraping if it fails
+      const apiResults = await searchViaApi(query);
+      const results = (apiResults && apiResults.length > 0)
+        ? apiResults
+        : await searchViaDom(query);
+
       chrome.runtime.sendMessage({
         type: 'LINKEDIN_SEARCH_RESULTS',
         results: results.slice(0, 7),
@@ -529,7 +600,7 @@
       });
     } catch (err) {
       console.warn('[SpreadUp] search error:', err);
-      showLinkedInSearch();
+      chrome.runtime.sendMessage({ type: 'LINKEDIN_SEARCH_RESULTS', results: [], query });
     } finally {
       searchInProgress = false;
     }
