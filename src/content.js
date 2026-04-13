@@ -224,7 +224,10 @@
 
     if (!editor) {
       // Step 2: Click "Start a post" — search by text content (classes are obfuscated)
-      const trigger = shadowFindByText('[role="button"], button', 'Start a post');
+      // Try exact match first, then partial match for LinkedIn UI variations
+      const trigger = shadowFindByText('[role="button"], button', 'Start a post')
+        || shadowQueryAll('[role="button"], button').find((el) => el.textContent?.trim().toLowerCase().includes('start a post'))
+        || shadowQueryAll('[role="button"], button').find((el) => el.textContent?.trim().toLowerCase().includes('write an article'));
 
       if (!trigger) {
         // Fallback: copy to clipboard
@@ -265,7 +268,15 @@
 
     // Step 6: Find and click LinkedIn's own "Post" button (inside shadow DOM)
     const postBtn = await pollFor(() => {
-      const btn = shadowFindByText('button', 'Post');
+      // Exact match first
+      let btn = shadowFindByText('button', 'Post');
+      // Fallback: find submit-style buttons in the composer dialog
+      if (!btn) {
+        btn = shadowQueryAll('button').find((b) => {
+          const t = b.textContent?.trim().toLowerCase();
+          return t === 'post' || t === 'submit' || (t?.includes('post') && t.length < 15);
+        });
+      }
       return (btn && !btn.disabled) ? btn : null;
     }, 5000);
 
@@ -348,90 +359,83 @@
     await delay(2000);
   }
 
-  // ─── LinkedIn typeahead search (runs in PAGE context, not content script) ──
-  // Content scripts run in an isolated world and can't access LinkedIn's
-  // cookies/auth properly. We inject a <script> into the actual page that
-  // makes the API call with full access to LinkedIn's session.
+  // ─── LinkedIn typeahead search ──────────────────────────────────────────────
+  // Content script runs on linkedin.com so fetch with credentials: 'include'
+  // automatically sends LinkedIn's session cookies. We get the CSRF token
+  // from document.cookie (JSESSIONID is not httpOnly on LinkedIn).
+  // Falls back to background script if content script fetch fails.
 
-  let pageSearchInjected = false;
+  async function searchLinkedInTypeahead(query) {
+    let results = [];
 
-  function injectPageSearchScript() {
-    if (pageSearchInjected) return;
-    pageSearchInjected = true;
+    try {
+      // Try content script direct fetch first (same-origin, cookies included)
+      const csrf = document.cookie.match(/JSESSIONID="?([^";]+)/)?.[1] || '';
 
-    const script = document.createElement('script');
-    script.textContent = `
-      (function() {
-        window.addEventListener('message', async function(e) {
-          if (e.data?.type !== '__SPREADUP_SEARCH__') return;
-          const query = e.data.query;
-          const results = [];
-          try {
-            const csrf = document.cookie.match(/JSESSIONID="?([^";]+)/)?.[1] || '';
-            if (!csrf) throw new Error('no csrf');
-
-            const resp = await fetch(
-              'https://www.linkedin.com/voyager/api/typeahead/hitsV2?keywords='
-              + encodeURIComponent(query)
-              + '&origin=GLOBAL_SEARCH_HEADER&q=blended',
-              {
-                headers: {
-                  'csrf-token': csrf,
-                  'x-restli-protocol-version': '2.0.0',
-                },
-                credentials: 'include',
-              }
-            );
-            if (resp.ok) {
-              const data = await resp.json();
-              const items = data?.included || data?.elements || [];
-              const seen = new Set();
-              for (const item of items) {
-                let name = null, title = '';
-                if (item.firstName) {
-                  name = (item.firstName + ' ' + (item.lastName || '')).trim();
-                  title = item.occupation || '';
-                } else if (item.title && item.title.text) {
-                  name = item.title.text;
-                  title = item.subtext?.text || item.headline?.text || '';
-                }
-                if (name && name.length > 1 && name.length < 60 && !seen.has(name)) {
-                  seen.add(name);
-                  results.push({ name: name, title: title });
-                }
-                if (results.length >= 7) break;
-              }
-            }
-          } catch(err) {
-            console.warn('[SpreadUp] page search error:', err);
+      if (csrf) {
+        const resp = await fetch(
+          `https://www.linkedin.com/voyager/api/typeahead/hitsV2?keywords=${encodeURIComponent(query)}&origin=GLOBAL_SEARCH_HEADER&q=blended`,
+          {
+            headers: {
+              'csrf-token': csrf,
+              'x-restli-protocol-version': '2.0.0',
+            },
+            credentials: 'include',
           }
-          window.postMessage({
-            type: '__SPREADUP_SEARCH_RESULTS__',
-            results: results,
-            query: query
-          }, '*');
+        );
+
+        if (resp.ok) {
+          const data = await resp.json();
+          results = parseTypeaheadResults(data);
+        }
+      }
+
+      // Fallback: ask background script (uses chrome.cookies API)
+      if (!results.length) {
+        const bgResp = await new Promise((resolve) => {
+          chrome.runtime.sendMessage({ type: 'SEARCH_LINKEDIN', payload: { query } }, resolve);
         });
-      })();
-    `;
-    document.documentElement.appendChild(script);
-    script.remove(); // script runs immediately, element no longer needed
-  }
-
-  function searchLinkedInTypeahead(query) {
-    injectPageSearchScript();
-    window.postMessage({ type: '__SPREADUP_SEARCH__', query }, '*');
-  }
-
-  // Listen for results from the injected page script and forward to panel
-  window.addEventListener('message', (e) => {
-    if (e.data?.type === '__SPREADUP_SEARCH_RESULTS__') {
-      panelFrame?.contentWindow?.postMessage({
-        type: 'LINKEDIN_SEARCH_RESULTS',
-        results: e.data.results || [],
-        query: e.data.query,
-      }, '*');
+        results = bgResp?.results || [];
+      }
+    } catch (err) {
+      console.warn('[SpreadUp] search error:', err);
+      // Last resort fallback to background
+      try {
+        const bgResp = await new Promise((resolve) => {
+          chrome.runtime.sendMessage({ type: 'SEARCH_LINKEDIN', payload: { query } }, resolve);
+        });
+        results = bgResp?.results || [];
+      } catch (_) {}
     }
-  });
+
+    panelFrame?.contentWindow?.postMessage({
+      type: 'LINKEDIN_SEARCH_RESULTS',
+      results,
+      query,
+    }, '*');
+  }
+
+  function parseTypeaheadResults(data) {
+    const items = data?.included || data?.elements || [];
+    const results = [];
+    const seen = new Set();
+    for (const item of items) {
+      let name = null, title = '';
+      if (item.firstName) {
+        name = `${item.firstName} ${item.lastName || ''}`.trim();
+        title = item.occupation || '';
+      } else if (item.title?.text) {
+        name = item.title.text;
+        title = item.subtext?.text || item.headline?.text || '';
+      }
+      if (name && name.length > 1 && name.length < 60 && !seen.has(name) && !/^urn:/.test(name)) {
+        seen.add(name);
+        results.push({ name, title });
+      }
+      if (results.length >= 7) break;
+    }
+    return results;
+  }
 
   // ─── Message handler (from panel iframe) ─────────────────────────────────────
 

@@ -1036,14 +1036,9 @@ function triggerSearch(query) {
   if (!query || query.length < 1) return;
 
   // Debounce 150ms for near real-time feel
-  // Call background script directly — panel is an extension page with full API access
+  // Send to content script (runs on linkedin.com, has cookie access for API)
   mentionTimer = setTimeout(() => {
-    chrome.runtime.sendMessage({ type: 'SEARCH_LINKEDIN', payload: { query } }, (resp) => {
-      if (!mentionActive) return;
-      mentionResults = (resp?.results || []).slice(0, 7);
-      if (mentionResults.length) mentionSelected = 0;
-      renderMentionDropdown(getMentionQuery());
-    });
+    window.parent.postMessage({ type: 'SEARCH_LINKEDIN', payload: { query } }, '*');
   }, 150);
 }
 
@@ -1101,7 +1096,15 @@ editorArea.addEventListener('keydown', (e) => {
   }
 });
 
-// (LinkedIn search results now handled directly in triggerSearch callback)
+// Receive LinkedIn search results from content script
+window.addEventListener('message', (e) => {
+  if (e.source !== window.parent) return;
+  if (e.data?.type === 'LINKEDIN_SEARCH_RESULTS' && mentionActive) {
+    mentionResults = (e.data.results || []).slice(0, 7);
+    if (mentionResults.length) mentionSelected = 0;
+    renderMentionDropdown(getMentionQuery());
+  }
+});
 
 // ─── File / image attachments ────────────────────────────────────────────────
 
