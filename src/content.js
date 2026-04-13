@@ -483,11 +483,10 @@
     await delay(2000);
   }
 
-  // ─── CSRF helper (used by publishViaApi) ──────────────────────────────────────
-  // LinkedIn stores the CSRF token in the JSESSIONID cookie.
-  // NOTE: @mention search is handled entirely in the background service worker
-  // (which reads httpOnly cookies via chrome.cookies.get). This helper is only
-  // needed for the publish API calls that run from the content script.
+  // ─── CSRF helper (used by publishViaApi and Voyager search) ─────────────────
+  // For publish: reads JSESSIONID from document.cookie (works if not httpOnly).
+  // For search: background supplies the csrf via message payload (reads httpOnly
+  // cookie via chrome.cookies.get, then forwards it here).
 
   function getLinkedInCsrf() {
     return document.cookie
@@ -496,6 +495,66 @@
       .find((c) => c.startsWith('JSESSIONID='))
       ?.split('=').slice(1).join('=')
       ?.replace(/^"|"$/g, '') || null;
+  }
+
+  // ─── Voyager people search (called by background with csrf token) ─────────────
+  // Pure API call — zero DOM interaction. The content script runs on linkedin.com
+  // so credentials: 'include' sends session cookies automatically.
+
+  async function searchVoyagerApi(query, csrf) {
+    if (!csrf || !query) return [];
+
+    const params = new URLSearchParams({
+      keywords: query,
+      origin: 'OTHER',
+      q: 'type',
+      type: 'PEOPLE',
+    });
+
+    try {
+      const res = await fetch(`/voyager/api/typeahead/hitsV2?${params}`, {
+        credentials: 'include',
+        headers: {
+          'csrf-token':                csrf,
+          'x-restli-protocol-version': '2.0.0',
+          'x-li-lang':                 'en_US',
+          'accept':                    'application/vnd.linkedin.normalized+json+2.1',
+        },
+      });
+
+      if (!res.ok) return [];
+
+      const json = await res.json();
+      const elements = json?.data?.elements ?? json?.elements ?? [];
+
+      return elements
+        .map((el) => {
+          const hit = el.hitInfo ? Object.values(el.hitInfo)[0] : el;
+          const name  = hit?.text?.text   ?? hit?.name     ?? '';
+          const title = hit?.subtext?.text ?? hit?.headline ?? '';
+
+          const artifact =
+            hit?.image?.attributes?.[0]?.detailData
+              ?.['com.linkedin.voyager.dash.common.image.ImageViewModel']
+              ?.artifacts?.[0]
+            ?? hit?.image?.attributes?.[0]?.detailData
+              ?.['com.linkedin.voyager.common.image.ImageViewModel']
+              ?.artifacts?.[0];
+
+          const avatar = artifact?.fileIdentifyingUrlPathSegment
+            ? `https://media.licdn.com/dms/image/${artifact.fileIdentifyingUrlPathSegment}`
+            : (hit?.image?.rootUrl
+                ? hit.image.rootUrl + (artifact?.fileIdentifyingUrlPathSegment ?? '')
+                : '');
+
+          return { name, title, avatar };
+        })
+        .filter((r) => r.name && r.name.length > 1 && r.name.length < 60)
+        .slice(0, 7);
+    } catch (err) {
+      console.warn('[SpreadUp] Voyager search error:', err);
+      return [];
+    }
   }
 
   // ─── Message handler (from panel via chrome.runtime relay) ───────────────────
@@ -537,10 +596,18 @@
 
     // Listen for messages from panel (relayed via background service worker)
     chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-      // Only handle messages forwarded by the background script
-      if (msg._fromBackground) {
-        handleMessage(msg);
+      if (!msg._fromBackground) return;
+
+      // _SEARCH_VOYAGER: async API call — must return true to keep sendResponse alive
+      if (msg.type === '_SEARCH_VOYAGER') {
+        const { query, csrf } = msg.payload || {};
+        searchVoyagerApi(query, csrf)
+          .then((results) => sendResponse({ results }))
+          .catch(() => sendResponse({ results: [] }));
+        return true; // keep channel open for async sendResponse
       }
+
+      handleMessage(msg);
     });
 
     // Reconnect to existing panel iframe (e.g. after extension reload)

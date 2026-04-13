@@ -256,77 +256,44 @@ async function fetchOgMeta(url) {
 // broadcast to the panel via chrome.runtime.sendMessage — the content script is
 // never involved in the search flow.
 
-async function getLinkedInCookies() {
-  const cookies = await chrome.cookies.getAll({ url: 'https://www.linkedin.com' });
-  const csrf = cookies.find(c => c.name === 'JSESSIONID')?.value?.replace(/^"|"$/g, '') || null;
-  const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-  return { csrf, cookieHeader };
+async function getLinkedInCsrf() {
+  const cookie = await chrome.cookies.get({ url: 'https://www.linkedin.com', name: 'JSESSIONID' });
+  return cookie?.value?.replace(/^"|"$/g, '') || null;
 }
 
 async function searchLinkedInPeople(query) {
-  if (!query) return { type: 'LINKEDIN_SEARCH_RESULTS', results: [], query };
+  const empty = { type: 'LINKEDIN_SEARCH_RESULTS', results: [], query };
+  if (!query) return empty;
 
   try {
-    const { csrf, cookieHeader } = await getLinkedInCookies();
+    // 1. Read httpOnly JSESSIONID via chrome.cookies (content scripts can't)
+    const csrf = await getLinkedInCsrf();
     if (!csrf) {
       console.warn('[SpreadUp] No JSESSIONID cookie — user may not be logged into LinkedIn');
-      return { type: 'LINKEDIN_SEARCH_RESULTS', results: [], query };
+      return empty;
     }
 
-    const params = new URLSearchParams({
-      keywords: query,
-      origin: 'OTHER',
-      q: 'type',
-      type: 'PEOPLE',
+    // 2. Forward to content script WITH the csrf token.
+    //    Content script runs on linkedin.com so credentials: 'include' sends
+    //    session cookies automatically — no forbidden Cookie header needed.
+    const tabs = await chrome.tabs.query({ url: 'https://www.linkedin.com/*' });
+    const tab = tabs[0];
+    if (!tab) return empty;
+
+    const response = await chrome.tabs.sendMessage(tab.id, {
+      type: '_SEARCH_VOYAGER',
+      payload: { query, csrf },
+      _fromBackground: true,
     });
 
-    const res = await fetch(`https://www.linkedin.com/voyager/api/typeahead/hitsV2?${params}`, {
-      headers: {
-        'csrf-token':                csrf,
-        'x-restli-protocol-version': '2.0.0',
-        'x-li-lang':                 'en_US',
-        'accept':                    'application/vnd.linkedin.normalized+json+2.1',
-        'cookie':                    cookieHeader,
-      },
-    });
-
-    if (!res.ok) {
-      console.warn(`[SpreadUp] Voyager search returned ${res.status}`);
-      return { type: 'LINKEDIN_SEARCH_RESULTS', results: [], query };
-    }
-
-    const json = await res.json();
-    const elements = json?.data?.elements ?? json?.elements ?? [];
-
-    const results = elements
-      .map((el) => {
-        const hit = el.hitInfo ? Object.values(el.hitInfo)[0] : el;
-        const name  = hit?.text?.text   ?? hit?.name     ?? '';
-        const title = hit?.subtext?.text ?? hit?.headline ?? '';
-
-        const artifact =
-          hit?.image?.attributes?.[0]?.detailData
-            ?.['com.linkedin.voyager.dash.common.image.ImageViewModel']
-            ?.artifacts?.[0]
-          ?? hit?.image?.attributes?.[0]?.detailData
-            ?.['com.linkedin.voyager.common.image.ImageViewModel']
-            ?.artifacts?.[0];
-
-        const avatar = artifact?.fileIdentifyingUrlPathSegment
-          ? `https://media.licdn.com/dms/image/${artifact.fileIdentifyingUrlPathSegment}`
-          : (hit?.image?.rootUrl
-              ? hit.image.rootUrl + (artifact?.fileIdentifyingUrlPathSegment ?? '')
-              : '');
-
-        return { name, title, avatar };
-      })
-      .filter((r) => r.name && r.name.length > 1 && r.name.length < 60)
-      .slice(0, 7);
-
-    return { type: 'LINKEDIN_SEARCH_RESULTS', results, query };
+    return {
+      type: 'LINKEDIN_SEARCH_RESULTS',
+      results: response?.results || [],
+      query,
+    };
   } catch (err) {
     console.warn('[SpreadUp] search error:', err);
-    return { type: 'LINKEDIN_SEARCH_RESULTS', results: [], query };
+    return empty;
   }
 }
 
