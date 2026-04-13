@@ -167,12 +167,30 @@ function setupEditorEvents() {
   });
 
   // Auto-format on paste: convert markdown + run smart format
-  editorArea.addEventListener('paste', () => {
-    // Let the pasted text land in the textarea first, then format
-    setTimeout(() => {
-      state.editorText = editorArea.value;
-      smartFormat();
-    }, 50);
+  editorArea.addEventListener('paste', (e) => {
+    // Get the pasted plain text directly from clipboard
+    const pasted = e.clipboardData?.getData('text/plain');
+    if (!pasted) return;
+
+    e.preventDefault(); // prevent default paste
+
+    // Convert any markdown in pasted text
+    const converted = convertMarkdown(pasted);
+
+    // Insert converted text at cursor position (or replace selection)
+    const start = editorArea.selectionStart;
+    const end = editorArea.selectionEnd;
+    const before = editorArea.value.slice(0, start);
+    const after = editorArea.value.slice(end);
+    editorArea.value = before + converted + after;
+
+    // Move cursor to end of pasted text
+    const newPos = start + converted.length;
+    editorArea.setSelectionRange(newPos, newPos);
+
+    // Sync state and run smart format on full text
+    state.editorText = editorArea.value;
+    smartFormat();
   });
 }
 
@@ -734,6 +752,8 @@ function convertMarkdown(text) {
     .replace(/```[\s\S]*?```/g, (m) => m.replace(/^```\w*\n?/, '').replace(/\n?```$/, ''));
 }
 
+let formatCycle = 0; // cycles through different formatting styles
+
 function smartFormat() {
   let raw = editorArea.value.trim();
   if (!raw) return;
@@ -741,7 +761,10 @@ function smartFormat() {
   // Convert any markdown formatting first
   raw = convertMarkdown(raw);
 
-  const bullet     = $('#bullet-style').value || '•';
+  const BULLET_STYLES = ['•', '▸', '✦', '→'];
+  const style = formatCycle % 3; // 0 = standard, 1 = minimal, 2 = heavy
+  const bullet = style === 0 ? ($('#bullet-style').value || '•')
+               : BULLET_STYLES[formatCycle % BULLET_STYLES.length];
   const BULLET_RE  = /^(->|=>|–|—|[-*•]|\d+[.):])\s*/;
   const isBullet   = (s) => /^[•▸✦◆✅]/.test(s);
   const isURL      = (s) => /^https?:\/\//i.test(s.trim());
@@ -780,18 +803,36 @@ function smartFormat() {
     return 'body';
   }
 
-  // ── 4. Bold heuristics ───────────────────────────────────────────────────────
+  // ── 4. Bold heuristics (varies by style) ─────────────────────────────────────
   function applyBold(text) {
     if (isURL(text)) return text;
+
+    if (style === 1) {
+      // Minimal: only bold numbers+units and ALL-CAPS
+      return text
+        .replace(/\b(\$?\d[\d,]*(?:\.\d+)?(?:[kKmMbBxX%]|\s?(?:years?|hours?|days?|weeks?|months?|times?|people|users?|%)))\b/g,
+          (m) => convertText(m, 'bold'))
+        .replace(/\b([A-Z]{2,5})\b/g, (m) => convertText(m, 'bold'));
+    }
+
+    if (style === 2) {
+      // Heavy: bold numbers, caps, quotes, colon-words, AND first 2-4 words of each sentence
+      return text
+        .replace(/\b(\$?\d[\d,]*(?:\.\d+)?(?:[kKmMbBxX%]|\s?(?:years?|hours?|days?|weeks?|months?|times?|people|users?|%)))\b/g,
+          (m) => convertText(m, 'bold'))
+        .replace(/\b([A-Z]{2,5})\b/g, (m) => convertText(m, 'bold'))
+        .replace(/"([^"]{3,40})"/g, (_, w) => '"' + convertText(w, 'bold') + '"')
+        .replace(/:\s+([A-Z][a-z]{2,})/g, (_, w) => ': ' + convertText(w, 'bold'))
+        // Bold first meaningful phrase of each sentence
+        .replace(/(?:^|(?<=[.!?]\s))([A-Z][a-z]+(?:\s[a-z]+){0,2})/g, (m) => convertText(m, 'bold'));
+    }
+
+    // Standard (style 0): moderate bolding
     return text
-      // Numbers + unit: "3x", "50%", "$1M", "10 years"
       .replace(/\b(\$?\d[\d,]*(?:\.\d+)?(?:[kKmMbBxX%]|\s?(?:years?|hours?|days?|weeks?|months?|times?|people|users?|%)))\b/g,
         (m) => convertText(m, 'bold'))
-      // ALL-CAPS acronyms (2–5 letters)
       .replace(/\b([A-Z]{2,5})\b/g, (m) => convertText(m, 'bold'))
-      // Text inside "quotes" or 'quotes'
       .replace(/"([^"]{3,40})"/g, (_, w) => '"' + convertText(w, 'bold') + '"')
-      // First meaningful word after a colon
       .replace(/:\s+([A-Z][a-z]{2,})/g, (_, w) => ': ' + convertText(w, 'bold'));
   }
 
@@ -876,39 +917,32 @@ $('#btn-smart-format').addEventListener('click', async () => {
   const raw = editorArea.value;
   if (!raw.trim()) return;
 
-  const { anthropicKey } = await chrome.storage.local.get('anthropicKey');
   const btn = $('#btn-smart-format');
+  const { anthropicKey } = await chrome.storage.local.get('anthropicKey');
 
-  if (!anthropicKey) {
-    // No key — run local heuristic and nudge user to settings
+  // Increment format cycle so each click produces a different style
+  formatCycle++;
+
+  if (anthropicKey) {
+    btn.textContent = '⏳…';
+    btn.disabled = true;
+    try {
+      const result = await bg('SMART_FORMAT', { text: raw });
+      if (result?.text) {
+        editorArea.value = result.text;
+        state.editorText = result.text;
+        updateStats();
+        updatePreview();
+      } else {
+        smartFormat();
+      }
+    } finally {
+      btn.textContent = '✨ Format';
+      btn.disabled = false;
+    }
+  } else {
+    // No API key — use local heuristic (cycles through styles)
     smartFormat();
-    const keyStatus = $('#anthropic-key-status');
-    switchTab('settings');
-    if (keyStatus) {
-      keyStatus.textContent = '← Add your Anthropic API key here to enable AI formatting.';
-      keyStatus.style.color = '#D97706';
-    }
-    return;
-  }
-
-  btn.textContent = '⏳…';
-  btn.disabled = true;
-
-  try {
-    const result = await bg('SMART_FORMAT', { text: raw });
-    if (result?.text) {
-      editorArea.value = result.text;
-      state.editorText = result.text;
-      updateStats();
-      updatePreview();
-    } else {
-      // API error — fall back to heuristic
-      smartFormat();
-      console.warn('[SpreadUp] AI format error:', result?.error);
-    }
-  } finally {
-    btn.textContent = '✨ Format';
-    btn.disabled = false;
   }
 });
 
@@ -951,6 +985,10 @@ let mentionSearchTimer = null;
 
 const mentionDropdown = $('#mention-dropdown');
 const mentionList     = $('#mention-list');
+
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
 
 function getMentionQuery() {
   if (mentionAtPos < 0) return '';
@@ -1011,11 +1049,11 @@ function renderMentionList(query) {
     mentionList.innerHTML = mentionResults.map((r, i) => `
       <div class="mention-item${i === mentionSelected ? ' mention-selected' : ''}" data-idx="${i}">
         <div class="mention-item-avatar">
-          ${r.avatar ? `<img src="${r.avatar}" style="width:100%;height:100%;border-radius:50%;"/>` : r.name[0].toUpperCase()}
+          ${r.avatar ? `<img src="${r.avatar}" style="width:100%;height:100%;border-radius:50%;"/>` : escapeHtml(r.name[0]).toUpperCase()}
         </div>
         <div>
-          <div class="mention-item-name">${r.name}</div>
-          ${r.title ? `<div class="mention-item-sub">${r.title}</div>` : ''}
+          <div class="mention-item-name">${escapeHtml(r.name)}</div>
+          ${r.title ? `<div class="mention-item-sub">${escapeHtml(r.title)}</div>` : ''}
         </div>
       </div>
     `).join('');
@@ -1024,13 +1062,13 @@ function renderMentionList(query) {
       <div class="mention-item mention-selected" data-idx="-1">
         <div class="mention-item-avatar">@</div>
         <div>
-          <div class="mention-item-name">@${q}</div>
+          <div class="mention-item-name">@${escapeHtml(q)}</div>
           <div class="mention-item-sub">Press Enter or Tab to insert</div>
         </div>
       </div>
-      <div class="mention-tip">Searching LinkedIn…</div>`;
+      ${q.length >= 2 ? '<div class="mention-tip">Searching LinkedIn…</div>' : '<div class="mention-tip">Type 2+ characters to search</div>'}`;
   } else {
-    mentionList.innerHTML = `<div class="mention-tip">Keep typing a name to search…</div>`;
+    mentionList.innerHTML = `<div class="mention-tip">Type a name to tag someone…</div>`;
   }
 
   // Bind clicks
@@ -1046,18 +1084,30 @@ function renderMentionList(query) {
   });
 }
 
+let mentionSearchTimeout = null;
+
 function searchLinkedIn(query) {
   clearTimeout(mentionSearchTimer);
+  clearTimeout(mentionSearchTimeout);
+
   if (!query.trim() || query.length < 2) {
     mentionResults = [];
     renderMentionList(query);
     return;
   }
-  // Debounce: wait 300ms before searching
+
+  // Debounce: wait 250ms before searching
   mentionSearchTimer = setTimeout(() => {
     // Ask content script to search LinkedIn's typeahead
     window.parent.postMessage({ type: 'SEARCH_LINKEDIN', payload: { query: query.trim() } }, '*');
-  }, 300);
+
+    // If no results come back within 2s, clear "Searching..." message
+    mentionSearchTimeout = setTimeout(() => {
+      if (mentionActive && !mentionResults.length) {
+        renderMentionList(getMentionQuery());
+      }
+    }, 2000);
+  }, 250);
 }
 
 // Handle @ key and inline typing

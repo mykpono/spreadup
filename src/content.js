@@ -341,56 +341,87 @@
 
   async function searchLinkedInTypeahead(query) {
     const results = [];
-    try {
-      // LinkedIn's Voyager typeahead API (works because content script runs on linkedin.com)
-      const csrfToken = document.cookie.match(/JSESSIONID="?([^";]+)/)?.[1] || '';
-      const resp = await fetch(
-        `https://www.linkedin.com/voyager/api/typeahead/hitsV2?keywords=${encodeURIComponent(query)}&origin=GLOBAL_SEARCH_HEADER&q=blended&types=List(PEOPLE,COMPANY)`,
-        {
-          headers: {
-            'csrf-token': csrfToken,
-            'x-restli-protocol-version': '2.0.0',
-          },
-          credentials: 'include',
-        }
-      );
 
-      if (resp.ok) {
-        const data = await resp.json();
-        const hits = data?.data?.elements || data?.elements || [];
-        for (const hit of hits.slice(0, 8)) {
-          const target = hit.hitInfo?.actorInsight?.actor || hit.hitInfo?.result || hit;
-          const name = target?.title?.text
-            || target?.name?.text
-            || hit.text?.text
-            || hit.title?.text;
-          const title = target?.subtext?.text
-            || target?.headline?.text
-            || hit.subtext?.text
-            || '';
-          const avatar = target?.image?.attributes?.[0]?.detailData?.nonEntityProfilePicture?.vectorImage?.rootUrl || '';
-          if (name) {
-            results.push({ name, title, avatar });
+    // Try LinkedIn's Voyager typeahead API
+    try {
+      // CSRF token from cookie — LinkedIn stores it with quotes
+      const cookieMatch = document.cookie.match(/JSESSIONID="?([^";]+)/);
+      const csrfToken = cookieMatch ? cookieMatch[1].replace(/"/g, '') : '';
+
+      if (csrfToken) {
+        const resp = await fetch(
+          `https://www.linkedin.com/voyager/api/typeahead/hitsV2?keywords=${encodeURIComponent(query)}&origin=GLOBAL_SEARCH_HEADER&q=blended&types=List(PEOPLE,COMPANY)`,
+          {
+            headers: {
+              'csrf-token': csrfToken,
+              'x-restli-protocol-version': '2.0.0',
+            },
+            credentials: 'include',
+          }
+        );
+
+        if (resp.ok) {
+          const data = await resp.json();
+          // LinkedIn nests results in various places depending on API version
+          const elements = data?.included || data?.data?.elements || data?.elements || [];
+          for (const el of elements.slice(0, 10)) {
+            // Look for profile/company objects in the included array
+            const name = el?.title?.text
+              || el?.firstName && `${el.firstName} ${el.lastName || ''}`
+              || el?.name
+              || null;
+            const title = el?.headline?.text
+              || el?.subtext?.text
+              || el?.occupation
+              || el?.industry
+              || '';
+            const avatar = el?.picture?.rootUrl
+              || el?.image?.attributes?.[0]?.detailData?.nonEntityProfilePicture?.vectorImage?.rootUrl
+              || '';
+            if (name && name.length > 1 && name.length < 60) {
+              results.push({ name: name.trim(), title, avatar });
+            }
           }
         }
       }
     } catch (err) {
-      console.warn('[SpreadUp] LinkedIn typeahead error:', err);
+      console.warn('[SpreadUp] LinkedIn typeahead API error:', err);
     }
 
-    // If API fails or returns nothing, fall back to scraping visible names on page
+    // Fallback: scrape visible names from the current LinkedIn page
     if (!results.length) {
-      const nameEls = shadowQueryAll('span.t-bold, span[dir="ltr"] > span');
-      const seen = new Set();
-      for (const el of nameEls) {
-        const name = el.textContent?.trim();
-        if (name && name.length > 2 && name.length < 50
-            && !seen.has(name)
-            && name.toLowerCase().includes(query.toLowerCase())) {
-          seen.add(name);
-          results.push({ name, title: '', avatar: '' });
-          if (results.length >= 6) break;
+      try {
+        // Try multiple selector patterns for LinkedIn's current DOM
+        const selectors = [
+          'span.feed-shared-actor__name',
+          'span.t-bold span[aria-hidden="true"]',
+          'span.t-bold',
+          '.feed-shared-actor__title span',
+          'a[data-control-name] span',
+          '.entity-result__title-text a span',
+        ];
+
+        const seen = new Set();
+        const queryLower = query.toLowerCase();
+
+        for (const sel of selectors) {
+          const els = [...shadowQueryAll(sel), ...document.querySelectorAll(sel)];
+          for (const el of els) {
+            const name = el.textContent?.trim();
+            if (name && name.length > 2 && name.length < 50
+                && !seen.has(name)
+                && name.toLowerCase().includes(queryLower)
+                && !/^\d/.test(name)          // skip numbers
+                && !/follow|like|comment|repost|view/i.test(name)) {  // skip action labels
+              seen.add(name);
+              results.push({ name, title: '', avatar: '' });
+              if (results.length >= 8) break;
+            }
+          }
+          if (results.length >= 8) break;
         }
+      } catch (err) {
+        console.warn('[SpreadUp] LinkedIn scrape fallback error:', err);
       }
     }
 
