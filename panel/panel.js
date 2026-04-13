@@ -166,19 +166,15 @@ function setupEditorEvents() {
     autosaveDraft();
   });
 
-  // Auto-format on paste: let text land, then convert markdown + smart format
+  // Auto-format on paste
   editorArea.addEventListener('paste', () => {
-    // Save text before paste to detect what was added
-    const beforePaste = editorArea.value;
-
-    // Wait for the browser to finish inserting pasted text, then format
+    const before = editorArea.value;
     setTimeout(() => {
-      if (editorArea.value === beforePaste) return; // nothing changed
-      // Convert markdown in the full text
-      editorArea.value = convertMarkdown(editorArea.value);
-      state.editorText = editorArea.value;
-      smartFormat();
-    }, 150);
+      if (editorArea.value !== before) {
+        state.editorText = editorArea.value;
+        formatPostText();
+      }
+    }, 100);
   });
 }
 
@@ -716,182 +712,111 @@ async function loadLocalData() {
   state.snippets = data.snippets || [];
 }
 
-// ─── Smart Format ─────────────────────────────────────────────────────────────
-// Pure heuristic — no AI API needed.
-// Pipeline: markdown convert → parse → detect structure → reformat → bold key phrases → assemble
+// ─── Post Formatter ──────────────────────────────────────────────────────────
+// Analyzes text and formats it for LinkedIn: paragraphs, bullets, bolding.
+// Runs automatically on paste and on Format button click.
 
-function convertMarkdown(text) {
-  return text
-    // Bold: **text** or __text__
-    .replace(/\*\*(.+?)\*\*/g, (_, inner) => convertText(inner, 'bold'))
-    .replace(/__(.+?)__/g, (_, inner) => convertText(inner, 'bold'))
-    // Italic: *text* or _text_ (but not inside words like file_name)
-    .replace(/(?<!\w)\*([^*\n]+?)\*(?!\w)/g, (_, inner) => convertText(inner, 'italic'))
-    .replace(/(?<!\w)_([^_\n]+?)_(?!\w)/g, (_, inner) => convertText(inner, 'italic'))
-    // Headers: # Header → bold text (strip the #)
-    .replace(/^#{1,3}\s+(.+)$/gm, (_, inner) => convertText(inner, 'bold'))
-    // Unordered list markers: - item, * item → bullet
-    .replace(/^[-*]\s+/gm, '• ')
-    // Strikethrough: ~~text~~
-    .replace(/~~(.+?)~~/g, (_, inner) => [...inner].map((c) => c + '\u0336').join(''))
-    // Inline code: `code` → strip backticks
+const BULLET_RE = /^(\s*)(->|=>|–|—|[-*•▸✦→]|\d+[.):])\s+/;
+const URL_LINE  = /^https?:\/\/\S+$/i;
+
+function formatPostText() {
+  let text = editorArea.value;
+  if (!text.trim()) return;
+
+  // Step 1: Convert markdown syntax to LinkedIn Unicode
+  text = text
+    .replace(/\*\*(.+?)\*\*/g, (_, s) => convertText(s, 'bold'))
+    .replace(/__(.+?)__/g, (_, s) => convertText(s, 'bold'))
+    .replace(/(?<!\w)\*([^*\n]+?)\*(?!\w)/g, (_, s) => convertText(s, 'italic'))
+    .replace(/(?<!\w)_([^_\n]+?)_(?!\w)/g, (_, s) => convertText(s, 'italic'))
+    .replace(/^#{1,3}\s+(.+)$/gm, (_, s) => convertText(s, 'bold'))
+    .replace(/~~(.+?)~~/g, (_, s) => [...s].map(c => c + '\u0336').join(''))
     .replace(/`([^`]+)`/g, '$1')
-    // Code blocks: ```...``` → strip fences
-    .replace(/```[\s\S]*?```/g, (m) => m.replace(/^```\w*\n?/, '').replace(/\n?```$/, ''));
-}
+    .replace(/```[\s\S]*?```/g, m => m.replace(/^```\w*\n?/, '').replace(/\n?```$/, ''));
 
-let formatCycle = 0; // cycles through different formatting styles
+  // Step 2: Normalize line breaks — collapse 3+ blank lines into 2
+  text = text.replace(/\n{3,}/g, '\n\n');
 
-function smartFormat() {
-  let raw = editorArea.value.trim();
-  if (!raw) return;
+  // Step 3: Convert bullet markers to clean bullets
+  const bullet = $('#bullet-style')?.value || '•';
+  text = text.replace(/^(\s*)(->|=>|–|—|[-*])\s+/gm, `$1${bullet} `);
 
-  // Convert any markdown formatting first
-  raw = convertMarkdown(raw);
-
-  const BULLET_STYLES = ['•', '▸', '✦', '→'];
-  const style = formatCycle % 3; // 0 = standard, 1 = minimal, 2 = heavy
-  const bullet = style === 0 ? ($('#bullet-style').value || '•')
-               : BULLET_STYLES[formatCycle % BULLET_STYLES.length];
-  const BULLET_RE  = /^(->|=>|–|—|[-*•]|\d+[.):])\s*/;
-  const isBullet   = (s) => /^[•▸✦◆✅]/.test(s);
-  const isURL      = (s) => /^https?:\/\//i.test(s.trim());
-
-  // ── 1. Split raw text into sentences, preserving blank lines as separators ──
-  const rawLines = raw.split('\n');
-
-  // ── 2. Group into logical blocks (runs of non-blank lines) ──────────────────
-  const blocks = []; // each block = array of trimmed non-empty strings
-  let current  = [];
-  for (const l of rawLines) {
-    const t = l.trim();
-    if (!t) {
-      if (current.length) { blocks.push(current); current = []; }
-    } else {
-      current.push(t);
-    }
-  }
-  if (current.length) blocks.push(current);
-
-  if (!blocks.length) return;
-
-  // ── 3. Classify each block ───────────────────────────────────────────────────
-  // Returns 'hook' | 'list' | 'url' | 'cta' | 'body'
-  function classifyBlock(lines, idx) {
-    const joined = lines.join(' ');
-    if (idx === 0 && joined.length <= 120 && lines.length <= 2) return 'hook';
-    if (lines.every((l) => BULLET_RE.test(l)))                  return 'list';
-    if (lines.length >= 3 && lines.every((l) => !BULLET_RE.test(l) && l.length < 100)) {
-      // Cluster of short lines — treat as implicit list
-      const avgLen = lines.reduce((s, l) => s + l.length, 0) / lines.length;
-      if (avgLen < 80) return 'list';
-    }
-    if (lines.length === 1 && isURL(lines[0]))                   return 'url';
-    if (idx === blocks.length - 1 && /\?$/.test(joined.trim()))  return 'cta';
-    return 'body';
-  }
-
-  // ── 4. Bold heuristics (varies by style) ─────────────────────────────────────
-  function applyBold(text) {
-    if (isURL(text)) return text;
-
-    if (style === 1) {
-      // Minimal: only bold numbers+units and ALL-CAPS
-      return text
-        .replace(/\b(\$?\d[\d,]*(?:\.\d+)?(?:[kKmMbBxX%]|\s?(?:years?|hours?|days?|weeks?|months?|times?|people|users?|%)))\b/g,
-          (m) => convertText(m, 'bold'))
-        .replace(/\b([A-Z]{2,5})\b/g, (m) => convertText(m, 'bold'));
-    }
-
-    if (style === 2) {
-      // Heavy: bold numbers, caps, quotes, colon-words, AND first 2-4 words of each sentence
-      return text
-        .replace(/\b(\$?\d[\d,]*(?:\.\d+)?(?:[kKmMbBxX%]|\s?(?:years?|hours?|days?|weeks?|months?|times?|people|users?|%)))\b/g,
-          (m) => convertText(m, 'bold'))
-        .replace(/\b([A-Z]{2,5})\b/g, (m) => convertText(m, 'bold'))
-        .replace(/"([^"]{3,40})"/g, (_, w) => '"' + convertText(w, 'bold') + '"')
-        .replace(/:\s+([A-Z][a-z]{2,})/g, (_, w) => ': ' + convertText(w, 'bold'))
-        // Bold first meaningful phrase of each sentence
-        .replace(/(?:^|(?<=[.!?]\s))([A-Z][a-z]+(?:\s[a-z]+){0,2})/g, (m) => convertText(m, 'bold'));
-    }
-
-    // Standard (style 0): moderate bolding
-    return text
-      .replace(/\b(\$?\d[\d,]*(?:\.\d+)?(?:[kKmMbBxX%]|\s?(?:years?|hours?|days?|weeks?|months?|times?|people|users?|%)))\b/g,
-        (m) => convertText(m, 'bold'))
-      .replace(/\b([A-Z]{2,5})\b/g, (m) => convertText(m, 'bold'))
-      .replace(/"([^"]{3,40})"/g, (_, w) => '"' + convertText(w, 'bold') + '"')
-      .replace(/:\s+([A-Z][a-z]{2,})/g, (_, w) => ': ' + convertText(w, 'bold'));
-  }
-
-  // ── 5. Split long body paragraph into shorter ones (≤3 sentences each) ──────
-  function splitBodyBlock(lines) {
-    const joined  = lines.join(' ');
-    // Simple sentence split on . ! ? followed by space + capital
-    const sentences = joined.match(/[^.!?]+[.!?]+(?:\s|$)/g) || [joined];
-    const chunks = [];
-    let chunk = [];
-    for (const s of sentences) {
-      chunk.push(s.trim());
-      if (chunk.length === 3) { chunks.push(chunk.join(' ')); chunk = []; }
-    }
-    if (chunk.length) chunks.push(chunk.join(' '));
-    return chunks;
-  }
-
-  // ── 6. Assemble formatted output ─────────────────────────────────────────────
-  const sections = [];
-
-  blocks.forEach((lines, idx) => {
-    const type = classifyBlock(lines, idx);
-
-    if (type === 'hook') {
-      // Hook: bold the whole line if short, else just key phrases
-      const text = lines.join(' ');
-      sections.push([text.length <= 60 ? convertText(text, 'bold') : applyBold(text)]);
-      return;
-    }
-
-    if (type === 'list') {
-      const items = lines.map((l) => {
-        const content = l.replace(BULLET_RE, '').trim();
-        // Bold first phrase before dash/colon in each item
-        const bolded  = content.replace(/^([^—:–,]{4,40})([—:–,])/, (_, phrase, sep) =>
-          convertText(phrase, 'bold') + sep
-        );
-        return bullet + ' ' + bolded;
-      });
-      sections.push(items);
-      return;
-    }
-
-    if (type === 'url') {
-      sections.push(lines); // URLs untouched
-      return;
-    }
-
-    if (type === 'cta') {
-      // CTA: keep as-is, optionally bold the action verb
-      const text = lines.join(' ');
-      sections.push([text.replace(/^(\w+)/, (m) => convertText(m, 'bold'))]);
-      return;
-    }
-
-    // type === 'body': split long blocks, bold key phrases
-    const chunks = splitBodyBlock(lines);
-    sections.push(chunks.map(applyBold));
-  });
-
-  // Join sections with blank lines; bullets within a list stay tight
+  // Step 4: Detect lines that should be bullets (short lines in a cluster)
+  const lines = text.split('\n');
   const output = [];
-  sections.forEach((section, i) => {
-    section.forEach((line, j) => {
-      output.push(line);
-      // Blank line between bullets only when next section starts
-      const nextLine = section[j + 1];
-      if (!nextLine && i < sections.length - 1) output.push('');
-    });
-  });
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    // Blank line — keep it
+    if (!trimmed) { output.push(''); i++; continue; }
+
+    // URL — keep as-is
+    if (URL_LINE.test(trimmed)) { output.push(trimmed); i++; continue; }
+
+    // Already a bullet — keep it
+    if (/^[•▸✦→◆✅]\s/.test(trimmed) || /^\d+[.)]\s/.test(trimmed)) {
+      output.push(trimmed); i++; continue;
+    }
+
+    // Check if this starts a cluster of short lines (implicit list)
+    let clusterEnd = i;
+    while (clusterEnd < lines.length) {
+      const cl = lines[clusterEnd].trim();
+      if (!cl) break;
+      if (cl.length > 100) break;
+      if (URL_LINE.test(cl)) break;
+      clusterEnd++;
+    }
+    const clusterLen = clusterEnd - i;
+
+    // 3+ short lines in a row without blank lines = implicit bullet list
+    if (clusterLen >= 3) {
+      const avgLen = lines.slice(i, clusterEnd).reduce((s, l) => s + l.trim().length, 0) / clusterLen;
+      if (avgLen < 80) {
+        for (let j = i; j < clusterEnd; j++) {
+          const cl = lines[j].trim();
+          if (!/^[•▸✦→◆✅]\s/.test(cl) && !/^\d+[.)]\s/.test(cl)) {
+            output.push(bullet + ' ' + cl);
+          } else {
+            output.push(cl);
+          }
+        }
+        i = clusterEnd;
+        continue;
+      }
+    }
+
+    // Long paragraph — split into sentences, max 2-3 per paragraph
+    if (trimmed.length > 200) {
+      const sentences = trimmed.match(/[^.!?]+[.!?]+/g) || [trimmed];
+      let para = [];
+      for (const s of sentences) {
+        para.push(s.trim());
+        if (para.length >= 2) {
+          output.push(para.join(' '));
+          output.push('');
+          para = [];
+        }
+      }
+      if (para.length) output.push(para.join(' '));
+      i++; continue;
+    }
+
+    // Regular line
+    output.push(trimmed);
+    i++;
+  }
+
+  // Step 5: Ensure blank line after first line (hook) if not already
+  if (output.length > 1 && output[0].trim() && output[1]?.trim()) {
+    output.splice(1, 0, '');
+  }
+
+  // Step 6: Trim trailing blank lines
+  while (output.length && !output[output.length - 1].trim()) output.pop();
 
   editorArea.value = output.join('\n');
   state.editorText = editorArea.value;
@@ -899,7 +824,37 @@ function smartFormat() {
   updatePreview();
 }
 
-// ─── Format button: AI if key set, heuristic fallback ─────────────────────────
+// Bold key phrases in the post (separate from structural formatting)
+function boldKeyPhrases() {
+  let text = editorArea.value;
+  if (!text.trim()) return;
+
+  const isUrl = (s) => /^https?:\/\//i.test(s.trim());
+
+  text = text.split('\n').map((line) => {
+    if (isUrl(line) || !line.trim()) return line;
+
+    return line
+      // Numbers with units: 3x, 50%, $1M, 10 years
+      .replace(/\b(\$?\d[\d,]*(?:\.\d+)?(?:[kKmMbBxX%]|\s?(?:years?|hours?|days?|weeks?|months?|times?|people|users?|%)))\b/g,
+        m => convertText(m, 'bold'))
+      // ALL-CAPS words (2-5 chars): API, DOM, UX
+      .replace(/\b([A-Z]{2,5})\b/g, m => convertText(m, 'bold'))
+      // Quoted text: "important phrase"
+      .replace(/"([^"]{3,40})"/g, (_, w) => '"' + convertText(w, 'bold') + '"')
+      // Text after colon: Key: Value
+      .replace(/:\s+([A-Z][a-z]{2,})/g, (_, w) => ': ' + convertText(w, 'bold'));
+  }).join('\n');
+
+  editorArea.value = text;
+  state.editorText = text;
+  updateStats();
+  updatePreview();
+}
+
+let formatClickCount = 0;
+
+// ─── Format button ───────────────────────────────────────────────────────────
 
 $('#btn-smart-format').addEventListener('click', async () => {
   const raw = editorArea.value;
@@ -908,8 +863,7 @@ $('#btn-smart-format').addEventListener('click', async () => {
   const btn = $('#btn-smart-format');
   const { anthropicKey } = await chrome.storage.local.get('anthropicKey');
 
-  // Increment format cycle so each click produces a different style
-  formatCycle++;
+  formatClickCount++;
 
   if (anthropicKey) {
     btn.textContent = '⏳…';
@@ -921,16 +875,21 @@ $('#btn-smart-format').addEventListener('click', async () => {
         state.editorText = result.text;
         updateStats();
         updatePreview();
-      } else {
-        smartFormat();
+        return;
       }
     } finally {
       btn.textContent = '✨ Format';
       btn.disabled = false;
     }
+  }
+
+  // Local formatting: alternate between structure + bold on each click
+  if (formatClickCount % 2 === 1) {
+    // First click: fix structure (paragraphs, bullets, spacing)
+    formatPostText();
   } else {
-    // No API key — use local heuristic (cycles through styles)
-    smartFormat();
+    // Second click: bold key phrases
+    boldKeyPhrases();
   }
 });
 
@@ -960,22 +919,17 @@ async function setupAnthropicKey() {
   });
 }
 
-// ─── @ Mention system (inline) ───────────────────────────────────────────────
-// Detects '@' typed in the editor textarea. As user types after '@', shows a
-// floating dropdown with LinkedIn search results. Selecting a result inserts
-// '@Name' at the cursor position. No separate input field needed.
+// ─── @ Mention (simple inline insertion) ─────────────────────────────────────
+// Type @ in the editor → dropdown appears → type name → Enter to insert @Name.
 
-let mentionActive   = false;
-let mentionAtPos    = -1;   // index of the '@' character in editorArea.value
-let mentionResults  = [];
-let mentionSelected = 0;    // highlighted index in dropdown
-let mentionSearchTimer = null;
+let mentionActive = false;
+let mentionAtPos  = -1;
 
 const mentionDropdown = $('#mention-dropdown');
 const mentionList     = $('#mention-list');
 
 function escapeHtml(s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 function getMentionQuery() {
@@ -985,201 +939,78 @@ function getMentionQuery() {
 
 function openMention() {
   mentionActive = true;
-  mentionAtPos = editorArea.selectionStart - 1; // position of '@'
-  mentionResults = [];
-  mentionSelected = 0;
-  positionMentionDropdown();
-  renderMentionList('');
+  mentionAtPos = editorArea.selectionStart - 1;
+  positionDropdown();
+  updateMentionUI('');
   mentionDropdown.classList.remove('hidden');
 }
 
 function closeMention() {
   mentionActive = false;
   mentionAtPos = -1;
-  mentionResults = [];
   mentionDropdown.classList.add('hidden');
-  clearTimeout(mentionSearchTimer);
 }
 
-function positionMentionDropdown() {
-  // Position dropdown near the cursor in the textarea
+function positionDropdown() {
   const rect = editorArea.getBoundingClientRect();
-  // Estimate cursor Y from line count
   const textBefore = editorArea.value.slice(0, editorArea.selectionStart);
   const lineCount = textBefore.split('\n').length;
-  const lineHeight = 20; // approx
-  const cursorY = Math.min(lineCount * lineHeight, rect.height - 40);
-
+  const cursorY = Math.min(lineCount * 20, rect.height - 40);
   mentionDropdown.style.position = 'absolute';
   mentionDropdown.style.left = `${rect.left + 16}px`;
   mentionDropdown.style.top = `${rect.top + cursorY + 24}px`;
-  mentionDropdown.style.width = `${Math.min(rect.width - 32, 320)}px`;
+  mentionDropdown.style.width = `${Math.min(rect.width - 32, 280)}px`;
 }
 
 function insertMention(name) {
-  if (mentionAtPos < 0) return;
   const before = editorArea.value.slice(0, mentionAtPos);
   const after  = editorArea.value.slice(editorArea.selectionStart);
-  const tag    = `@${name} `;
+  const tag = `@${name} `;
   editorArea.value = before + tag + after;
-  const newPos = before.length + tag.length;
-  editorArea.setSelectionRange(newPos, newPos);
+  editorArea.setSelectionRange(before.length + tag.length, before.length + tag.length);
   state.editorText = editorArea.value;
   updateStats(); updatePreview();
   closeMention();
   editorArea.focus();
 }
 
-function renderMentionList(query) {
-  const q = query.trim();
-
-  if (mentionResults.length) {
-    mentionList.innerHTML = mentionResults.map((r, i) => `
-      <div class="mention-item${i === mentionSelected ? ' mention-selected' : ''}" data-idx="${i}">
-        <div class="mention-item-avatar">
-          ${r.avatar ? `<img src="${r.avatar}" style="width:100%;height:100%;border-radius:50%;"/>` : escapeHtml(r.name[0]).toUpperCase()}
-        </div>
-        <div>
-          <div class="mention-item-name">${escapeHtml(r.name)}</div>
-          ${r.title ? `<div class="mention-item-sub">${escapeHtml(r.title)}</div>` : ''}
-        </div>
-      </div>
-    `).join('');
-  } else if (q) {
+function updateMentionUI(q) {
+  if (q) {
     mentionList.innerHTML = `
-      <div class="mention-item mention-selected" data-idx="-1">
+      <div class="mention-item mention-selected" id="mention-insert">
         <div class="mention-item-avatar" style="background:#1a1a2e;color:#F59E0B;font-weight:700">@</div>
         <div>
           <div class="mention-item-name">@${escapeHtml(q)}</div>
-          <div class="mention-item-sub">Press Enter to insert</div>
+          <div class="mention-item-sub">Enter to insert</div>
         </div>
       </div>`;
+    $('#mention-insert')?.addEventListener('click', () => insertMention(q));
   } else {
     mentionList.innerHTML = `<div class="mention-tip">Type a name…</div>`;
   }
-
-  // Bind clicks
-  $$('.mention-item[data-idx]', mentionList).forEach((el) => {
-    el.addEventListener('click', () => {
-      const idx = parseInt(el.dataset.idx);
-      if (idx >= 0 && mentionResults[idx]) {
-        insertMention(mentionResults[idx].name);
-      } else {
-        insertMention(q);
-      }
-    });
-  });
 }
 
-let mentionSearchTimeout = null;
-
-function searchLinkedIn(query) {
-  clearTimeout(mentionSearchTimer);
-  clearTimeout(mentionSearchTimeout);
-
-  if (!query.trim() || query.length < 2) {
-    mentionResults = [];
-    renderMentionList(query);
-    return;
-  }
-
-  // Debounce: wait 300ms before searching
-  mentionSearchTimer = setTimeout(async () => {
-    const q = query.trim();
-
-    // Strategy 1: Ask background script to search via LinkedIn API (has host_permissions)
-    try {
-      const result = await bg('SEARCH_LINKEDIN', { query: q });
-      if (result?.results?.length && mentionActive) {
-        mentionResults = result.results;
-        mentionSelected = 0;
-        renderMentionList(getMentionQuery());
-        return;
-      }
-    } catch (_) {}
-
-    // Strategy 2: Ask content script to scrape names from the LinkedIn page
-    window.parent.postMessage({ type: 'SEARCH_LINKEDIN', payload: { query: q } }, '*');
-
-    // If no results after 2s, update UI
-    mentionSearchTimeout = setTimeout(() => {
-      if (mentionActive && !mentionResults.length) {
-        renderMentionList(getMentionQuery());
-      }
-    }, 2000);
-  }, 300);
-}
-
-// Handle @ key and inline typing
-editorArea.addEventListener('input', (e) => {
+// Track @ typing
+editorArea.addEventListener('input', () => {
   if (!mentionActive) return;
-
-  const query = getMentionQuery();
-
-  // Close if user deleted the '@' or moved cursor before it
-  if (editorArea.selectionStart <= mentionAtPos) {
-    closeMention();
-    return;
+  const q = getMentionQuery();
+  if (editorArea.selectionStart <= mentionAtPos || q.includes(' ') || q.includes('\n')) {
+    closeMention(); return;
   }
-
-  // Close on space (user finished typing and didn't select)
-  if (query.includes(' ') || query.includes('\n')) {
-    closeMention();
-    return;
-  }
-
-  searchLinkedIn(query);
-  renderMentionList(query);
+  updateMentionUI(q);
 });
 
 editorArea.addEventListener('keydown', (e) => {
-  // Detect '@' — open mention mode
   if (e.key === '@' && !mentionActive) {
     setTimeout(() => openMention(), 0);
     return;
   }
-
   if (!mentionActive) return;
-
-  if (e.key === 'Escape') {
-    e.preventDefault();
-    closeMention();
-    return;
-  }
-
-  if (e.key === 'ArrowDown') {
-    e.preventDefault();
-    mentionSelected = Math.min(mentionSelected + 1, mentionResults.length - 1);
-    renderMentionList(getMentionQuery());
-    return;
-  }
-
-  if (e.key === 'ArrowUp') {
-    e.preventDefault();
-    mentionSelected = Math.max(mentionSelected - 1, 0);
-    renderMentionList(getMentionQuery());
-    return;
-  }
-
+  if (e.key === 'Escape') { e.preventDefault(); closeMention(); return; }
   if (e.key === 'Enter' || e.key === 'Tab') {
-    e.preventDefault();
-    if (mentionResults.length && mentionResults[mentionSelected]) {
-      insertMention(mentionResults[mentionSelected].name);
-    } else {
-      const q = getMentionQuery().trim();
-      if (q) insertMention(q);
-    }
-    return;
-  }
-});
-
-// Listen for LinkedIn search results from content script
-window.addEventListener('message', (e) => {
-  if (e.source !== window.parent) return;
-  if (e.data?.type === 'LINKEDIN_SEARCH_RESULTS' && mentionActive) {
-    mentionResults = e.data.results || [];
-    mentionSelected = 0;
-    renderMentionList(getMentionQuery());
+    const q = getMentionQuery().trim();
+    if (q) { e.preventDefault(); insertMention(q); }
+    else closeMention();
   }
 });
 
