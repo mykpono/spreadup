@@ -167,18 +167,71 @@
   // ─── LinkedIn profile scraping ────────────────────────────────────────────────
 
   function getLinkedInProfile() {
-    // LinkedIn's UI is inside a Shadow DOM — document.querySelectorAll won't find it
-    const ownImg = shadowQueryAll('img').find((i) =>
-      i.src?.includes('profile-displayphoto') &&
-      i.alt && i.alt.length > 0 &&
-      !i.alt.startsWith('View ')
-    );
+    // Strategy 1: Find profile photo in the global nav bar (most reliable).
+    // LinkedIn's nav "Me" button or profile link contains the logged-in user's photo.
+    let ownImg = null;
 
-    const name   = ownImg?.alt || null;
+    // Try nav-specific selectors first (shadow DOM aware)
+    const navImgSelectors = [
+      'img.global-nav__me-photo',
+      'img[class*="global-nav__me"]',
+      'img[class*="nav__menu-item__icon"]',
+      // LinkedIn sometimes uses these patterns in the nav
+      'header img[alt]:not([alt=""])',
+      'nav img[alt]:not([alt=""])',
+    ];
+
+    for (const sel of navImgSelectors) {
+      const candidates = shadowQueryAll(sel).filter(i =>
+        i.alt && i.alt.length > 0 && i.width <= 64
+      );
+      if (candidates.length) { ownImg = candidates[0]; break; }
+    }
+
+    // Strategy 2: Any img whose src contains profile photo CDN patterns
+    if (!ownImg) {
+      const cdnPatterns = ['profile-displayphoto', 'profile-framedphoto', '/dms/image/'];
+      ownImg = shadowQueryAll('img').find((i) => {
+        if (!i.alt || i.alt.length === 0) return false;
+        if (i.alt.startsWith('View ') || i.alt.toLowerCase().includes('company')) return false;
+        if (i.width > 80 || i.height > 80) return false; // nav photos are small
+        return cdnPatterns.some(p => i.src?.includes(p));
+      });
+    }
+
+    // Strategy 3: Broader - find any small nav image with a reasonable name alt text
+    if (!ownImg) {
+      ownImg = shadowQueryAll('img').find((i) => {
+        if (!i.alt || i.alt.length < 2 || i.alt.length > 60) return false;
+        if (i.alt.startsWith('View ') || /^\d/.test(i.alt)) return false;
+        const src = i.src || '';
+        return src.includes('licdn.com') || src.includes('linkedin.com');
+      });
+    }
+
+    const name   = ownImg?.alt?.replace(/\s*Photo$/, '').trim() || null;
     const avatar = ownImg?.src || null;
 
     let headline = null;
-    if (ownImg && name) {
+
+    // Try to get headline from the profile page sidebar or nav hover card
+    if (name) {
+      // Look for the user's own profile link text which often contains name + headline
+      const profileLinks = shadowQueryAll('a[href*="/in/"]');
+      for (const link of profileLinks) {
+        const text = link.innerText?.trim();
+        if (!text || !text.includes(name)) continue;
+        const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+        const idx = lines.findIndex(l => l === name || l.includes(name));
+        if (idx !== -1 && lines[idx + 1] && lines[idx + 1].length > 8) {
+          headline = lines[idx + 1];
+          break;
+        }
+      }
+    }
+
+    // Fallback: traverse up from the image to find a text container
+    if (!headline && ownImg && name) {
       let container = ownImg.parentElement;
       for (let k = 0; k < 8; k++) {
         if (!container) break;
@@ -188,10 +241,10 @@
       }
       if (container) {
         const lines = container.innerText.split('\n').map((l) => l.trim()).filter(Boolean);
-        const idx = lines.findIndex((l) => l === name);
+        const idx = lines.findIndex((l) => l === name || l.includes(name));
         if (idx !== -1 && lines[idx + 1]) {
           const candidate = lines[idx + 1];
-          headline = candidate.length > 10 ? candidate : (lines[idx + 2] || null);
+          headline = candidate.length > 8 ? candidate : (lines[idx + 2] || null);
         }
       }
     }
@@ -504,57 +557,158 @@
   async function searchVoyagerApi(query, csrf) {
     if (!csrf || !query) return [];
 
-    const params = new URLSearchParams({
-      keywords: query,
-      origin: 'OTHER',
-      q: 'type',
-      type: 'PEOPLE',
-    });
-
-    try {
-      const res = await fetch(`/voyager/api/typeahead/hitsV2?${params}`, {
-        credentials: 'include',
-        headers: {
-          'csrf-token':                csrf,
-          'x-restli-protocol-version': '2.0.0',
-          'x-li-lang':                 'en_US',
-          'accept':                    'application/vnd.linkedin.normalized+json+2.1',
-        },
-      });
-
-      if (!res.ok) return [];
-
-      const json = await res.json();
-      const elements = json?.data?.elements ?? json?.elements ?? [];
-
-      return elements
-        .map((el) => {
-          const hit = el.hitInfo ? Object.values(el.hitInfo)[0] : el;
-          const name  = hit?.text?.text   ?? hit?.name     ?? '';
-          const title = hit?.subtext?.text ?? hit?.headline ?? '';
-
-          const artifact =
-            hit?.image?.attributes?.[0]?.detailData
-              ?.['com.linkedin.voyager.dash.common.image.ImageViewModel']
-              ?.artifacts?.[0]
-            ?? hit?.image?.attributes?.[0]?.detailData
-              ?.['com.linkedin.voyager.common.image.ImageViewModel']
-              ?.artifacts?.[0];
-
-          const avatar = artifact?.fileIdentifyingUrlPathSegment
-            ? `https://media.licdn.com/dms/image/${artifact.fileIdentifyingUrlPathSegment}`
-            : (hit?.image?.rootUrl
-                ? hit.image.rootUrl + (artifact?.fileIdentifyingUrlPathSegment ?? '')
-                : '');
-
-          return { name, title, avatar };
-        })
-        .filter((r) => r.name && r.name.length > 1 && r.name.length < 60)
-        .slice(0, 7);
-    } catch (err) {
-      console.warn('[SpreadUp] Voyager search error:', err);
-      return [];
+    // ── Avatar extractor — handles 4 different LinkedIn image nested shapes ──────
+    function extractAvatar(hit) {
+      try {
+        const attrs = (hit?.image?.attributes) || [];
+        for (const attr of attrs) {
+          // Shape A: detailData keyed by a type URI containing "ImageViewModel"
+          const dd = attr?.detailData || {};
+          const vmKey = Object.keys(dd).find(k => k.includes('ImageViewModel'));
+          if (vmKey) {
+            const vm = dd[vmKey];
+            const art = (vm?.artifacts || [])[0];
+            if (art?.fileIdentifyingUrlPathSegment) {
+              const root = vm.rootUrl || 'https://media.licdn.com/dms/image/';
+              return root + art.fileIdentifyingUrlPathSegment;
+            }
+          }
+          // Shape B: com.linkedin.common.VectorImage at attribute root
+          const vi = attr?.['com.linkedin.common.VectorImage'];
+          if (vi?.rootUrl) {
+            const art = (vi.artifacts || [])[0];
+            return art ? vi.rootUrl + art.fileIdentifyingUrlPathSegment : vi.rootUrl;
+          }
+        }
+        // Shape C: rootUrl directly on image
+        if (hit?.image?.rootUrl) return hit.image.rootUrl;
+      } catch (_) {}
+      return '';
     }
+
+    // ── Person extractor — called on each raw element or included item ───────────
+    function extractPerson(raw) {
+      // raw may have a hitInfo wrapper keyed by a type URI
+      const hit = (raw?.hitInfo && Object.values(raw.hitInfo)[0]) || raw;
+      if (!hit) return null;
+
+      // Name — stored in different fields across API versions
+      // IMPORTANT: avoid operator-precedence pitfalls, use explicit || chains
+      const nameParts = [
+        hit.text && hit.text.text,
+        hit.title && hit.title.text,
+        hit.name,
+        (hit.firstName || hit.lastName)
+          ? `${hit.firstName || ''} ${hit.lastName || ''}`.trim()
+          : null,
+      ];
+      const name = (nameParts.find(v => v && v.trim()) || '').trim();
+      if (!name || name.length < 2 || name.length > 80) return null;
+
+      const titleParts = [
+        hit.subtext && hit.subtext.text,
+        hit.subtitle && hit.subtitle.text,
+        hit.headline,
+        hit.occupation,
+      ];
+      const title = (titleParts.find(v => v && v.trim()) || '').trim();
+      const avatar = extractAvatar(hit);
+
+      return { name, title, avatar };
+    }
+
+    // ── Response parser — handles plain JSON and normalized+json formats ──────────
+    function parseResponse(json) {
+      const people = [];
+
+      // Format 1 (plain JSON / application/json):
+      //   { data: { elements: [ { hitInfo: { TypeUri: {...} } } ] } }
+      // or { elements: [ ... ] }
+      const elements = json?.data?.elements || json?.elements || [];
+      for (const el of elements) {
+        // In normalized format, elements are URN strings — skip them here
+        if (typeof el === 'string') continue;
+        const p = extractPerson(el);
+        if (p) people.push(p);
+      }
+
+      // Format 2 (normalized+json):
+      //   { included: [ { $type: '...TypeaheadHit', text: {...}, subtext: {...} } ], data: { elements: ['urn:...'] } }
+      // When elements are URNs, the actual hit objects live in `included`.
+      if (!people.length && Array.isArray(json?.included)) {
+        for (const item of json.included) {
+          if (!item || typeof item !== 'object') continue;
+          // Only process typeahead hit types, skip member/company/other entries
+          const type = item.$type || item['$type'] || '';
+          if (type && !type.toLowerCase().includes('typeahead') && !type.toLowerCase().includes('hit')) {
+            // Accept anything that has a text.text field (best-effort)
+            if (!item?.text?.text) continue;
+          }
+          const p = extractPerson(item);
+          if (p) people.push(p);
+        }
+      }
+
+      return people.slice(0, 7);
+    }
+
+    // ── HTTP helper — logs failures, never throws ────────────────────────────────
+    async function fetchTypeahead(url, headers) {
+      try {
+        const res = await fetch(url, { credentials: 'include', headers });
+        if (!res.ok) {
+          console.warn('[SpreadUp] typeahead', res.status, url);
+          return [];
+        }
+        const json = await res.json();
+        const people = parseResponse(json);
+        console.log('[SpreadUp] typeahead', url, '→', people.length, 'results', people);
+        return people;
+      } catch (err) {
+        console.warn('[SpreadUp] typeahead fetch error:', err.message, url);
+        return [];
+      }
+    }
+
+    // Use plain JSON first (cleaner response, no URN indirection).
+    // Fall back to normalized+json if the first call returns nothing.
+    const baseHeaders = {
+      'csrf-token':                csrf,
+      'x-restli-protocol-version': '2.0.0',
+      'x-li-lang':                 'en_US',
+    };
+    const headersJson       = { ...baseHeaders, accept: 'application/json' };
+    const headersNormalized = { ...baseHeaders, accept: 'application/vnd.linkedin.normalized+json+2.1' };
+
+    const kw = encodeURIComponent(query);
+
+    // Attempt 1 — hitsV2 type=PEOPLE, plain JSON
+    let results = await fetchTypeahead(
+      `/voyager/api/typeahead/hitsV2?keywords=${kw}&origin=OTHER&q=type&type=PEOPLE`,
+      headersJson,
+    );
+    if (results.length) return results;
+
+    // Attempt 2 — hitsV2 type=PEOPLE, normalized+json (handles included array)
+    results = await fetchTypeahead(
+      `/voyager/api/typeahead/hitsV2?keywords=${kw}&origin=OTHER&q=type&type=PEOPLE`,
+      headersNormalized,
+    );
+    if (results.length) return results;
+
+    // Attempt 3 — hitsV2 blended (broader, may return mixed types)
+    results = await fetchTypeahead(
+      `/voyager/api/typeahead/hitsV2?keywords=${kw}&q=blended`,
+      headersJson,
+    );
+    if (results.length) return results;
+
+    // Attempt 4 — legacy hits endpoint
+    results = await fetchTypeahead(
+      `/voyager/api/typeahead/hits?keywords=${kw}&q=type&type=PEOPLE&count=7`,
+      headersJson,
+    );
+    return results;
   }
 
   // ─── Message handler (from panel via chrome.runtime relay) ───────────────────
@@ -593,6 +747,12 @@
 
   function init() {
     injectTriggerButton();
+
+    // Direct close via postMessage from the panel iframe (bypasses background relay).
+    // This fires immediately when the X is clicked, even if the background is busy.
+    window.addEventListener('message', (e) => {
+      if (e.data?.type === 'SPREADUP_CLOSE') hidePanel();
+    });
 
     // Listen for messages from panel (relayed via background service worker)
     chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {

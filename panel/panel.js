@@ -162,7 +162,11 @@ function switchTab(tab) {
 }
 
 btnClose.addEventListener('click', () => {
+  // Primary path: tell content script via background relay
   chrome.runtime.sendMessage({ type: 'CLOSE_PANEL' });
+  // Backup path: direct postMessage to parent page (content script listens)
+  // This works even when the background service worker is waking up or busy.
+  try { window.parent.postMessage({ type: 'SPREADUP_CLOSE' }, '*'); } catch (_) {}
 });
 
 // ─── Editor ───────────────────────────────────────────────────────────────────
@@ -587,12 +591,22 @@ function setupActions() {
       dataUrl: a.dataUrl,
     }));
     chrome.runtime.sendMessage({ type: 'PUBLISH_POST', payload: { text: state.editorText, attachments } });
-    // Safety net: if the page navigates (API success) we never hear back —
-    // if it doesn't navigate within 12s something went wrong, reset.
-    setTimeout(() => {
-      closePublishPreview();
+
+    // Safety net: if the page navigates (API success) we never hear back in the panel.
+    // After 14s, assume something stalled — copy text to clipboard and show a clear
+    // instruction rather than silently resetting.
+    setTimeout(async () => {
+      if (!btn.disabled) return; // already handled by PUBLISH_SUCCESS / PUBLISH_NEED_MANUAL
+      try {
+        await navigator.clipboard.writeText(state.editorText);
+        closePublishPreview();
+        showToast('Copied to clipboard — paste into the LinkedIn composer to post');
+      } catch (_) {
+        closePublishPreview();
+        showToast('Check LinkedIn — your post may already be there');
+      }
       resetConfirmBtn();
-    }, 12000);
+    }, 14000);
   });
 
   btnPaywallUpgrade.addEventListener('click', () => window.open(PAYMENT_URL, '_blank'));
@@ -622,10 +636,11 @@ function setupActions() {
         updatePreview();
         break;
       case 'PUBLISH_NEED_MANUAL':
-        // API unavailable — text is in the LinkedIn composer
+        // API unavailable — text has been inserted into the LinkedIn composer.
+        // Reset the confirm button so the user isn't stuck.
         closePublishPreview();
         resetConfirmBtn();
-        showToast('Your post is ready in LinkedIn — click Post to publish');
+        showToast('✓ Ready in LinkedIn — click the blue Post button to publish');
         break;
       case 'PUBLISH_COPY_FALLBACK':
         closePublishPreview();
@@ -966,7 +981,8 @@ function openMention() {
   mentionResults = [];
   mentionSelected = -1;
   positionDropdown();
-  renderMentionDropdown('');
+  // Show placeholder immediately — don't wait for search
+  mentionList.innerHTML = '<div class="mention-tip">Type a name to search LinkedIn…</div>';
   mentionDropdown.classList.remove('hidden');
 }
 
@@ -981,13 +997,26 @@ function closeMention() {
 
 function positionDropdown() {
   const rect = editorArea.getBoundingClientRect();
-  const textBefore = editorArea.value.slice(0, editorArea.selectionStart);
-  const lineCount = textBefore.split('\n').length;
-  const cursorY = Math.min(lineCount * 20, rect.height - 40);
-  // Keep CSS position: fixed — getBoundingClientRect() returns viewport coords
-  mentionDropdown.style.left = `${rect.left + 12}px`;
-  mentionDropdown.style.top = `${rect.top + cursorY + 24}px`;
-  mentionDropdown.style.width = `${Math.min(rect.width - 24, 320)}px`;
+
+  // Estimate the cursor's Y position within the textarea by counting newlines
+  // before the @ symbol. Line-height is ~20px (13px font × 1.6).
+  const textBefore = editorArea.value.slice(0, mentionAtPos >= 0 ? mentionAtPos : editorArea.selectionStart);
+  const linesBefore = textBefore.split('\n').length;
+  // Account for the textarea's own top padding (12px per CSS)
+  const lineHeight = 20;
+  const paddingTop = 12;
+  const rawY = rect.top + paddingTop + (linesBefore - 1) * lineHeight + lineHeight;
+
+  // Dropdown height is at most 200px; clamp so it stays within the viewport
+  const dropH = 200;
+  const vpH = window.innerHeight || document.documentElement.clientHeight;
+  const top = rawY + dropH > vpH ? rawY - dropH - lineHeight : rawY;
+
+  const width = Math.min(rect.width - 24, 320);
+
+  mentionDropdown.style.left  = `${rect.left + 12}px`;
+  mentionDropdown.style.top   = `${Math.max(0, top)}px`;
+  mentionDropdown.style.width = `${width}px`;
 }
 
 function insertMention(name) {
@@ -1061,19 +1090,27 @@ function triggerSearch(query) {
   clearTimeout(mentionTimer);
   if (!query || query.length < 1) return;
 
-  // Debounce 400ms — background service worker calls Voyager API directly
-  mentionTimer = setTimeout(() => {
-    // Show searching indicator
+  // Show "Searching…" immediately so the user gets instant feedback
+  if (!mentionResults.length) {
     mentionList.innerHTML = '<div class="mention-tip">Searching LinkedIn…</div>';
-    chrome.runtime.sendMessage({ type: 'SEARCH_LINKEDIN', payload: { query } }, (response) => {
-      // Results come back directly via sendResponse (no broadcast needed)
-      if (response?.type === 'LINKEDIN_SEARCH_RESULTS' && mentionActive) {
+  }
+
+  // Debounce 350ms before actually hitting the API
+  mentionTimer = setTimeout(() => {
+    const currentQuery = getMentionQuery();
+    if (!currentQuery || !mentionActive) return;
+
+    chrome.runtime.sendMessage({ type: 'SEARCH_LINKEDIN', payload: { query: currentQuery } }, (response) => {
+      // Guard: only apply if mention is still active and query hasn't changed
+      if (!mentionActive) return;
+      if (response?.type === 'LINKEDIN_SEARCH_RESULTS') {
+        const q = getMentionQuery();
         mentionResults = (response.results || []).slice(0, 7);
-        if (mentionResults.length) mentionSelected = 0;
-        renderMentionDropdown(getMentionQuery());
+        mentionSelected = mentionResults.length ? 0 : -1;
+        renderMentionDropdown(q);
       }
     });
-  }, 400);
+  }, 350);
 }
 
 // Track @ typing in editor
@@ -1083,10 +1120,14 @@ editorArea.addEventListener('input', () => {
   if (editorArea.selectionStart <= mentionAtPos || q.includes(' ') || q.includes('\n')) {
     closeMention(); return;
   }
-  // Reset selection when query changes
-  mentionSelected = mentionResults.length ? 0 : -1;
-  renderMentionDropdown(q);
-  triggerSearch(q);
+  // Re-position in case the editor scrolled or text above shifted
+  positionDropdown();
+  // Only reset selection highlight if query actually changed
+  if (q) {
+    triggerSearch(q);
+  } else {
+    renderMentionDropdown(q);
+  }
 });
 
 editorArea.addEventListener('keydown', (e) => {

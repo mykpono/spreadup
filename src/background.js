@@ -266,19 +266,23 @@ async function searchLinkedInPeople(query) {
   if (!query) return empty;
 
   try {
-    // 1. Read httpOnly JSESSIONID via chrome.cookies (content scripts can't)
+    // 1. Read httpOnly JSESSIONID via chrome.cookies (content scripts can't read it)
     const csrf = await getLinkedInCsrf();
     if (!csrf) {
-      console.warn('[SpreadUp] No JSESSIONID cookie — user may not be logged into LinkedIn');
+      console.warn('[SpreadUp] @mention search: no JSESSIONID cookie found — is the user logged into LinkedIn?');
       return empty;
     }
+    console.log('[SpreadUp] @mention search: csrf token found, querying content script for:', query);
 
     // 2. Forward to content script WITH the csrf token.
     //    Content script runs on linkedin.com so credentials: 'include' sends
-    //    session cookies automatically — no forbidden Cookie header needed.
+    //    session cookies automatically — no Cookie header needed (forbidden by CORS).
     const tabs = await chrome.tabs.query({ url: 'https://www.linkedin.com/*' });
     const tab = tabs[0];
-    if (!tab) return empty;
+    if (!tab) {
+      console.warn('[SpreadUp] @mention search: no LinkedIn tab found');
+      return empty;
+    }
 
     const response = await chrome.tabs.sendMessage(tab.id, {
       type: '_SEARCH_VOYAGER',
@@ -286,13 +290,15 @@ async function searchLinkedInPeople(query) {
       _fromBackground: true,
     });
 
+    const results = response?.results || [];
+    console.log('[SpreadUp] @mention search: got', results.length, 'results for', query);
     return {
       type: 'LINKEDIN_SEARCH_RESULTS',
-      results: response?.results || [],
+      results,
       query,
     };
   } catch (err) {
-    console.warn('[SpreadUp] search error:', err);
+    console.warn('[SpreadUp] @mention search error:', err.message || err);
     return empty;
   }
 }
