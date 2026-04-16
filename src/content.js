@@ -166,9 +166,66 @@
 
   // ─── LinkedIn profile scraping ────────────────────────────────────────────────
 
-  function getLinkedInProfile() {
-    // Strategy 1: Find profile photo in the global nav bar (most reliable).
-    // LinkedIn's nav "Me" button or profile link contains the logged-in user's photo.
+  async function getLinkedInProfile(csrfFromBackground) {
+    // Strategy 0: Voyager /me API — most reliable, not affected by LinkedIn DOM changes.
+    // Background supplies the CSRF token (reads httpOnly JSESSIONID via chrome.cookies).
+    try {
+      const csrf = csrfFromBackground || getLinkedInCsrf();
+      if (csrf) {
+        const res = await fetch('/voyager/api/me', {
+          credentials: 'include',
+          headers: {
+            'csrf-token':                csrf,
+            'x-restli-protocol-version': '2.0.0',
+            'accept':                    'application/vnd.linkedin.normalized+json+2.1',
+          },
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const included = data?.included || [];
+          const mini = included.find(i =>
+            (i.$type || '').toLowerCase().includes('miniprofile')
+          );
+          if (mini) {
+            const name     = `${mini.firstName || ''} ${mini.lastName || ''}`.trim() || null;
+            const headline = mini.occupation || null;
+
+            // LinkedIn's normalized+json stores the photo two ways:
+            //   A) Embedded: mini.picture = { $type: VectorImage, rootUrl, artifacts }
+            //   B) URN ref:  mini["*picture"] = "urn:li:digitalmediaAsset:…"
+            //      with the VectorImage as a separate entry in included[]
+            let avatar = null;
+            const photoVm = mini.picture;
+            if (photoVm?.rootUrl && photoVm?.artifacts?.length) {
+              // Format A — embedded VectorImage
+              const art = photoVm.artifacts[photoVm.artifacts.length - 1];
+              avatar = photoVm.rootUrl + art.fileIdentifyingUrlPathSegment;
+            } else {
+              // Format B — find the VectorImage in included[] by matching the URN.
+              // LinkedIn stores the reference as *picture or *profilePicture (varies by API version).
+              const pictureUrn = mini['*picture'] || mini['*profilePicture'];
+              if (pictureUrn) {
+                // Try exact entityUrn match first, then fall back to any VectorImage with rootUrl
+                const vi = included.find(i => i.entityUrn === pictureUrn)
+                        || included.find(i => (i.$type || '').toLowerCase().includes('vectorimage') && i.rootUrl);
+                if (vi?.rootUrl && vi?.artifacts?.length) {
+                  const art = vi.artifacts[vi.artifacts.length - 1];
+                  avatar = vi.rootUrl + art.fileIdentifyingUrlPathSegment;
+                } else if (vi?.rootUrl) {
+                  avatar = vi.rootUrl;
+                }
+              }
+              // Format C — rootUrl directly on mini (some API versions)
+              if (!avatar && mini.rootUrl) avatar = mini.rootUrl;
+            }
+
+            if (name) return { name, headline, avatar };
+          }
+        }
+      }
+    } catch (_) {}
+
+    // Strategy 1: Find profile photo in the global nav bar.
     let ownImg = null;
 
     // Try nav-specific selectors first (shadow DOM aware)
@@ -176,7 +233,6 @@
       'img.global-nav__me-photo',
       'img[class*="global-nav__me"]',
       'img[class*="nav__menu-item__icon"]',
-      // LinkedIn sometimes uses these patterns in the nav
       'header img[alt]:not([alt=""])',
       'nav img[alt]:not([alt=""])',
     ];
@@ -216,7 +272,6 @@
 
     // Try to get headline from the profile page sidebar or nav hover card
     if (name) {
-      // Look for the user's own profile link text which often contains name + headline
       const profileLinks = shadowQueryAll('a[href*="/in/"]');
       for (const link of profileLinks) {
         const text = link.innerText?.trim();
@@ -375,8 +430,8 @@
 
   // ─── Get current user's member URN via Voyager /me ──────────────────────────
 
-  async function getMyMemberUrn() {
-    const csrf = getLinkedInCsrf();
+  async function getMyMemberUrn(csrfOverride) {
+    const csrf = csrfOverride || getLinkedInCsrf();
     if (!csrf) return null;
     try {
       const res = await fetch('/voyager/api/me', {
@@ -395,13 +450,15 @@
 
   // ─── Post directly via LinkedIn Voyager API — no composer, no confirmation ───
 
-  async function publishViaApi(text) {
-    const csrf = getLinkedInCsrf();
+  async function publishViaApi(text, csrfFromBackground) {
+    // Prefer CSRF supplied by background (reads httpOnly cookie) over document.cookie
+    const csrf = csrfFromBackground || getLinkedInCsrf();
     if (!csrf) return null;
 
-    const authorUrn = await getMyMemberUrn();
+    const authorUrn = await getMyMemberUrn(csrf);
     if (!authorUrn) return null;
 
+    // Attempt 1: normShares endpoint (with author field required by current API)
     try {
       const res = await fetch('/voyager/api/contentcreation/normShares', {
         method: 'POST',
@@ -413,6 +470,7 @@
           'accept':                    'application/vnd.linkedin.normalized+json+2.1',
         },
         body: JSON.stringify({
+          author: authorUrn,
           visibleToGuest: true,
           shareAudience: { 'com.linkedin.voyager.feed.MemberAudience': { values: [] } },
           shareMediaCategory: 'NONE',
@@ -420,20 +478,53 @@
           text: { text },
         }),
       });
-      if (!res.ok) return null;
-      const data = await res.json();
-      const urn = data?.value?.id ?? data?.id;
-      if (!urn) return null;
-      return `https://www.linkedin.com/feed/update/${encodeURIComponent(urn)}/`;
-    } catch (_) { return null; }
+      if (res.ok) {
+        const data = await res.json();
+        const urn = data?.value?.id ?? data?.data?.id ?? data?.id;
+        if (urn) return `https://www.linkedin.com/feed/update/${encodeURIComponent(urn)}/`;
+      }
+    } catch (_) {}
+
+    // Attempt 2: ugcPosts endpoint (newer LinkedIn API format)
+    try {
+      const res = await fetch('/voyager/api/ugcPosts', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'csrf-token':                csrf,
+          'content-type':              'application/json',
+          'x-restli-protocol-version': '2.0.0',
+        },
+        body: JSON.stringify({
+          author: authorUrn,
+          lifecycleState: 'PUBLISHED',
+          specificContent: {
+            'com.linkedin.ugc.ShareContent': {
+              shareCommentary: { text },
+              shareMediaCategory: 'NONE',
+            },
+          },
+          visibility: {
+            'com.linkedin.ugc.MemberNetworkVisibility': 'PUBLIC',
+          },
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const urn = data?.id ?? data?.value?.id;
+        if (urn) return `https://www.linkedin.com/feed/update/${encodeURIComponent(urn)}/`;
+      }
+    } catch (_) {}
+
+    return null;
   }
 
   // ─── Publish flow ─────────────────────────────────────────────────────────────
 
-  async function handlePublish(text, attachments = []) {
+  async function handlePublish(text, attachments = [], csrfFromBackground) {
     // ── Fast path: post directly via API, navigate to the new post ─────────────
     showStatusToast('SpreadUp: Posting…');
-    const postUrl = await publishViaApi(text);
+    const postUrl = await publishViaApi(text, csrfFromBackground);
 
     if (postUrl) {
       chrome.runtime.sendMessage({ type: 'PUBLISH_SUCCESS', postUrl });
@@ -588,9 +679,18 @@
 
     // ── Person extractor — called on each raw element or included item ───────────
     function extractPerson(raw) {
-      // raw may have a hitInfo wrapper keyed by a type URI
-      const hit = (raw?.hitInfo && Object.values(raw.hitInfo)[0]) || raw;
+      // raw may have hitInfo nested 1 or 2 levels deep (TypeaheadHit → SearchProfile)
+      let hit = raw;
+      for (let depth = 0; depth < 2 && hit?.hitInfo; depth++) {
+        const inner = Object.values(hit.hitInfo)[0];
+        hit = (inner && typeof inner === 'object' && (inner.member || inner.entity || inner)) || hit;
+      }
       if (!hit) return null;
+
+      // Some responses wrap person fields inside a miniProfile sub-object
+      if (!hit.firstName && !hit.lastName && !hit.text && !hit.name && hit.miniProfile) {
+        hit = hit.miniProfile;
+      }
 
       // Name — stored in different fields across API versions
       // IMPORTANT: avoid operator-precedence pitfalls, use explicit || chains
@@ -608,6 +708,8 @@
       const titleParts = [
         hit.subtext && hit.subtext.text,
         hit.subtitle && hit.subtitle.text,
+        hit.primarySubtitle && hit.primarySubtitle.text,
+        hit.secondarySubtitle && hit.secondarySubtitle.text,
         hit.headline,
         hit.occupation,
       ];
@@ -621,29 +723,49 @@
     function parseResponse(json) {
       const people = [];
 
+      // Build a URN → included-item index for normalized+json lookups
+      const includedByUrn = {};
+      if (Array.isArray(json?.included)) {
+        for (const item of json.included) {
+          if (item && typeof item === 'object' && item.entityUrn) {
+            includedByUrn[item.entityUrn] = item;
+          }
+        }
+      }
+
       // Format 1 (plain JSON / application/json):
-      //   { data: { elements: [ { hitInfo: { TypeUri: {...} } } ] } }
-      // or { elements: [ ... ] }
-      const elements = json?.data?.elements || json?.elements || [];
-      for (const el of elements) {
-        // In normalized format, elements are URN strings — skip them here
-        if (typeof el === 'string') continue;
+      //   { data: { elements: [...] } } or { elements: [...] }
+      //   or Dash GraphQL: { data: { data: { "com.linkedin.voyager.dash.*": { elements: [...] } } } }
+      //   LinkedIn Dash GraphQL also uses "*elements" (asterisk-prefixed URN list) instead of "elements"
+      const dashNested = json?.data?.data ? Object.values(json.data.data)[0] : null;
+      const rawElements = json?.data?.elements || json?.elements
+        || dashNested?.elements || dashNested?.['*elements'] || [];
+      for (const el of rawElements) {
+        // In normalized format, elements are URN strings — resolve via included index
+        if (typeof el === 'string') {
+          const resolved = includedByUrn[el];
+          if (resolved) {
+            const p = extractPerson(resolved);
+            if (p) people.push(p);
+          }
+          continue;
+        }
         const p = extractPerson(el);
         if (p) people.push(p);
       }
 
       // Format 2 (normalized+json):
-      //   { included: [ { $type: '...TypeaheadHit', text: {...}, subtext: {...} } ], data: { elements: ['urn:...'] } }
-      // When elements are URNs, the actual hit objects live in `included`.
+      //   { included: [ { $type: '...TypeaheadHit', ... } ], data: { elements: ['urn:...'] } }
+      // When elements were all URN strings (or absent), scan included[] directly.
       if (!people.length && Array.isArray(json?.included)) {
         for (const item of json.included) {
           if (!item || typeof item !== 'object') continue;
-          // Only process typeahead hit types, skip member/company/other entries
-          const type = item.$type || item['$type'] || '';
-          if (type && !type.toLowerCase().includes('typeahead') && !type.toLowerCase().includes('hit')) {
-            // Accept anything that has a text.text field (best-effort)
-            if (!item?.text?.text) continue;
-          }
+          // Skip well-known non-person metadata types; let extractPerson gate the rest
+          const type = (item.$type || item['$type'] || '').toLowerCase();
+          if (type && (type.includes('paging') || type.includes('metadata')
+              || type.includes('config') || type.includes('footer')
+              || type.includes('vectorimage') || type.includes('imageviewmodel')
+              || type.includes('collectionresponse'))) continue;
           const p = extractPerson(item);
           if (p) people.push(p);
         }
@@ -657,55 +779,86 @@
       try {
         const res = await fetch(url, { credentials: 'include', headers });
         if (!res.ok) {
-          console.warn('[SpreadUp] typeahead', res.status, url);
+          console.warn('[SpreadUp] typeahead HTTP', res.status, url.split('?')[0]);
           return [];
         }
         const json = await res.json();
+        // Diagnostic: log raw response shape so we can verify parseResponse handles it
+        console.log('[SpreadUp] typeahead RAW shape:', {
+          topKeys:      Object.keys(json),
+          dataKeys:     json.data     ? Object.keys(json.data)      : [],
+          dataDataKeys: json.data?.data ? Object.keys(json.data.data) : [],
+          elemLen:      json.data?.elements?.length,
+          inclLen:      json.included?.length,
+          firstIncl:    JSON.stringify(json.included?.[0])?.slice(0, 200),
+          firstEl:      JSON.stringify(json.data?.elements?.[0] ?? json.elements?.[0])?.slice(0, 200),
+        });
         const people = parseResponse(json);
-        console.log('[SpreadUp] typeahead', url, '→', people.length, 'results', people);
+        console.log('[SpreadUp] typeahead →', people.length, 'results', url.split('queryId=')[1] || url.slice(-40));
         return people;
       } catch (err) {
-        console.warn('[SpreadUp] typeahead fetch error:', err.message, url);
+        console.warn('[SpreadUp] typeahead fetch error:', err.message, url.split('?')[0]);
         return [];
       }
     }
 
-    // Use plain JSON first (cleaner response, no URN indirection).
-    // Fall back to normalized+json if the first call returns nothing.
     const baseHeaders = {
       'csrf-token':                csrf,
       'x-restli-protocol-version': '2.0.0',
       'x-li-lang':                 'en_US',
+      'accept-language':           'en-US,en;q=0.9',
     };
     const headersJson       = { ...baseHeaders, accept: 'application/json' };
     const headersNormalized = { ...baseHeaders, accept: 'application/vnd.linkedin.normalized+json+2.1' };
 
     const kw = encodeURIComponent(query);
 
-    // Attempt 1 — hitsV2 type=PEOPLE, plain JSON
+    // Attempt 1 — voyagerSearchDashSharing with origin (LinkedIn's current mention endpoint, confirmed 2026)
+    // Uses the same variables structure LinkedIn's own composer sends for @mention autocomplete.
     let results = await fetchTypeahead(
-      `/voyager/api/typeahead/hitsV2?keywords=${kw}&origin=OTHER&q=type&type=PEOPLE`,
+      `/voyager/api/graphql?variables=(keywords:${kw},origin:OTHER,count:7,filters:List())&queryId=voyagerSearchDashSharing.4e26d0f2284baec4fa3fe92c090494cd`,
+      headersNormalized,
+    );
+    if (results.length) return results;
+
+    // Attempt 2 — same endpoint, minimal variables (no origin), normalized accept header
+    results = await fetchTypeahead(
+      `/voyager/api/graphql?includeWebMetadata=true&variables=(keywords:${kw})&queryId=voyagerSearchDashSharing.4e26d0f2284baec4fa3fe92c090494cd`,
+      headersNormalized,
+    );
+    if (results.length) return results;
+
+    // Attempt 3 — same endpoint, plain JSON accept header
+    results = await fetchTypeahead(
+      `/voyager/api/graphql?includeWebMetadata=true&variables=(keywords:${kw})&queryId=voyagerSearchDashSharing.4e26d0f2284baec4fa3fe92c090494cd`,
       headersJson,
     );
     if (results.length) return results;
 
-    // Attempt 2 — hitsV2 type=PEOPLE, normalized+json (handles included array)
+    // Attempt 4 — hitsV2 type=PEOPLE (older endpoint, kept as fallback)
     results = await fetchTypeahead(
       `/voyager/api/typeahead/hitsV2?keywords=${kw}&origin=OTHER&q=type&type=PEOPLE`,
       headersNormalized,
     );
     if (results.length) return results;
 
-    // Attempt 3 — hitsV2 blended (broader, may return mixed types)
+    // Attempt 5 — hitsV2 blended
     results = await fetchTypeahead(
       `/voyager/api/typeahead/hitsV2?keywords=${kw}&q=blended`,
       headersJson,
     );
     if (results.length) return results;
 
-    // Attempt 4 — legacy hits endpoint
+    // Attempt 6 — legacy hits endpoint
     results = await fetchTypeahead(
       `/voyager/api/typeahead/hits?keywords=${kw}&q=type&type=PEOPLE&count=7`,
+      headersJson,
+    );
+    if (results.length) return results;
+
+    // Attempt 7 — search/blended with PEOPLE filter
+    results = await fetchTypeahead(
+      `/voyager/api/search/blended?keywords=${kw}&origin=TYPEAHEAD_ESCAPE_HATCH&q=blended&filters=List(resultType-%3EPEOPLE)&count=7`,
       headersJson,
     );
     return results;
@@ -730,12 +883,13 @@
         break;
       }
       case 'GET_PROFILE': {
-        const profile = getLinkedInProfile();
-        chrome.runtime.sendMessage({ type: 'PROFILE_INFO', ...profile });
+        getLinkedInProfile(payload?.csrf).then(profile => {
+          chrome.runtime.sendMessage({ type: 'PROFILE_INFO', ...profile });
+        });
         break;
       }
       case 'PUBLISH_POST':
-        handlePublish(payload?.text, payload?.attachments || []);
+        handlePublish(payload?.text, payload?.attachments || [], payload?.csrf);
         break;
       // SEARCH_LINKEDIN is handled entirely in background.js — no content script involved
       default:

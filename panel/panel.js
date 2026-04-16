@@ -46,11 +46,16 @@ const postsRemainingLabel = $('#posts-remaining-label');
 const progressBar   = $('#progress-bar');
 const licenseSubEl  = $('#license-sub');
 const licenseBadge  = $('#license-badge');
-const settingsName  = $('#settings-name');
-const settingsEmail = $('#settings-email');
+const settingsName    = $('#settings-name');
+const settingsEmail   = $('#settings-email');
+const settingsVersion = $('#settings-version');
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 async function init() {
+  // Show the current extension version in Settings
+  const { version } = chrome.runtime.getManifest();
+  if (settingsVersion) settingsVersion.textContent = `v${version}`;
+
   await loadLocalData();
   renderHooks();
   renderCtas();
@@ -178,14 +183,39 @@ function setupEditorEvents() {
     autosaveDraft();
   });
 
-  // Auto-format on paste
+  // Auto-format on paste: use AI if an Anthropic key is configured, else local formatter
   editorArea.addEventListener('paste', () => {
     const before = editorArea.value;
-    setTimeout(() => {
-      if (editorArea.value !== before) {
-        state.editorText = editorArea.value;
+    setTimeout(async () => {
+      if (editorArea.value === before) return;
+      state.editorText = editorArea.value;
+
+      const { anthropicKey } = await chrome.storage.local.get('anthropicKey');
+      if (!anthropicKey) {
         formatPostText();
+        return;
       }
+
+      const raw = editorArea.value;
+      editorArea.disabled = true;
+      showToast('Formatting with AI…');
+      try {
+        // 5-second guard prevents indefinite editor lock if AI is slow
+        const result = await Promise.race([
+          bg('SMART_FORMAT', { text: raw }),
+          new Promise(r => setTimeout(() => r(null), 5000)),
+        ]);
+        if (result?.text) {
+          editorArea.value = result.text;
+          state.editorText = result.text;
+          updateStats();
+          updatePreview();
+          return;
+        }
+      } catch (_) {}
+      finally { editorArea.disabled = false; }
+      // AI failed or returned nothing — fall back to local formatter
+      formatPostText();
     }, 100);
   });
 }
@@ -1101,14 +1131,16 @@ function triggerSearch(query) {
     if (!currentQuery || !mentionActive) return;
 
     chrome.runtime.sendMessage({ type: 'SEARCH_LINKEDIN', payload: { query: currentQuery } }, (response) => {
-      // Guard: only apply if mention is still active and query hasn't changed
+      // Consume lastError to prevent uncaught-error noise in DevTools
+      void chrome.runtime.lastError;
+      // Guard: only apply if mention is still active
       if (!mentionActive) return;
-      if (response?.type === 'LINKEDIN_SEARCH_RESULTS') {
-        const q = getMentionQuery();
-        mentionResults = (response.results || []).slice(0, 7);
-        mentionSelected = mentionResults.length ? 0 : -1;
-        renderMentionDropdown(q);
-      }
+      // Update dropdown regardless of whether results arrived or not —
+      // this prevents the "Searching LinkedIn…" placeholder from getting stuck.
+      const q = getMentionQuery();
+      mentionResults = (response?.results || []).slice(0, 7);
+      mentionSelected = mentionResults.length ? 0 : -1;
+      renderMentionDropdown(q);
     });
   }, 350);
 }

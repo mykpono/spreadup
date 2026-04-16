@@ -257,8 +257,23 @@ async function fetchOgMeta(url) {
 // never involved in the search flow.
 
 async function getLinkedInCsrf() {
-  const cookie = await chrome.cookies.get({ url: 'https://www.linkedin.com', name: 'JSESSIONID' });
+  // Use getAll+domain so we match cookies regardless of path, subdomain, or
+  // SameSite/Secure flags — more reliable than an exact-URL get().
+  const cookies = await chrome.cookies.getAll({ name: 'JSESSIONID', domain: 'linkedin.com' });
+  const cookie  = cookies.find(c => c.value) || null;
   return cookie?.value?.replace(/^"|"$/g, '') || null;
+}
+
+// ─── Tab selector ─────────────────────────────────────────────────────────────
+// Prefers the currently active LinkedIn tab in the last-focused window so that
+// messages always reach the tab the user is actually looking at, even when
+// multiple LinkedIn tabs are open.
+
+async function getLinkedInTab() {
+  let tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true, url: 'https://www.linkedin.com/*' });
+  if (tabs.length) return tabs[0];
+  tabs = await chrome.tabs.query({ url: 'https://www.linkedin.com/*' });
+  return tabs[0] || null;
 }
 
 async function searchLinkedInPeople(query) {
@@ -277,8 +292,7 @@ async function searchLinkedInPeople(query) {
     // 2. Forward to content script WITH the csrf token.
     //    Content script runs on linkedin.com so credentials: 'include' sends
     //    session cookies automatically — no Cookie header needed (forbidden by CORS).
-    const tabs = await chrome.tabs.query({ url: 'https://www.linkedin.com/*' });
-    const tab = tabs[0];
+    const tab = await getLinkedInTab();
     if (!tab) {
       console.warn('[SpreadUp] @mention search: no LinkedIn tab found');
       return empty;
@@ -306,11 +320,24 @@ async function searchLinkedInPeople(query) {
 // ─── Forward messages to the active LinkedIn tab's content script ────────────
 
 async function forwardToContentScript(msg) {
-  const tabs = await chrome.tabs.query({ url: 'https://www.linkedin.com/*' });
-  const tab = tabs[0];
+  const tab = await getLinkedInTab();
   if (!tab) return { error: 'No LinkedIn tab found' };
-  // Forward with a source marker so content script knows it came via background
-  chrome.tabs.sendMessage(tab.id, { ...msg, _fromBackground: true });
+
+  // For PUBLISH_POST and GET_PROFILE: read the httpOnly JSESSIONID cookie and inject
+  // it into the payload so content.js doesn't need to read it from document.cookie
+  // (which fails when JSESSIONID is httpOnly, as LinkedIn now sets it).
+  let enriched = msg;
+  if (msg.type === 'PUBLISH_POST' || msg.type === 'GET_PROFILE') {
+    const csrf = await getLinkedInCsrf();
+    enriched = { ...msg, payload: { ...(msg.payload || {}), csrf } };
+  }
+
+  // Suppress "Receiving end does not exist" — thrown when the content script
+  // isn't injected yet (tab just opened, extension reloaded, etc.).
+  // The message is best-effort; if the content script isn't ready it's a no-op.
+  try {
+    await chrome.tabs.sendMessage(tab.id, { ...enriched, _fromBackground: true });
+  } catch (_) {}
   return { forwarded: true };
 }
 
