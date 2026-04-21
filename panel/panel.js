@@ -1012,7 +1012,7 @@ function openMention() {
   mentionSelected = -1;
   positionDropdown();
   // Show placeholder immediately — don't wait for search
-  mentionList.innerHTML = '<div class="mention-tip">Type a name to search LinkedIn…</div>';
+  mentionList.innerHTML = '<div class="mention-tip">Type a name, then press <kbd>Enter</kbd> to insert.</div>';
   mentionDropdown.classList.remove('hidden');
 }
 
@@ -1116,33 +1116,22 @@ function renderMentionDropdown(q) {
   });
 }
 
+// Debounced mention search. The background → content → main-world intercept
+// pipeline (see src/mention-intercept.js) replays LinkedIn's own typeahead
+// request with the user's query, so results match what LinkedIn's composer
+// would show.
 function triggerSearch(query) {
   clearTimeout(mentionTimer);
-  if (!query || query.length < 1) return;
-
-  // Show "Searching…" immediately so the user gets instant feedback
-  if (!mentionResults.length) {
-    mentionList.innerHTML = '<div class="mention-tip">Searching LinkedIn…</div>';
-  }
-
-  // Debounce 350ms before actually hitting the API
-  mentionTimer = setTimeout(() => {
-    const currentQuery = getMentionQuery();
-    if (!currentQuery || !mentionActive) return;
-
-    chrome.runtime.sendMessage({ type: 'SEARCH_LINKEDIN', payload: { query: currentQuery } }, (response) => {
-      // Consume lastError to prevent uncaught-error noise in DevTools
-      void chrome.runtime.lastError;
-      // Guard: only apply if mention is still active
-      if (!mentionActive) return;
-      // Update dropdown regardless of whether results arrived or not —
-      // this prevents the "Searching LinkedIn…" placeholder from getting stuck.
-      const q = getMentionQuery();
-      mentionResults = (response?.results || []).slice(0, 7);
-      mentionSelected = mentionResults.length ? 0 : -1;
-      renderMentionDropdown(q);
-    });
-  }, 350);
+  if (!query) return;
+  mentionTimer = setTimeout(async () => {
+    const requestedFor = query;
+    const res = await bg('SEARCH_LINKEDIN', { query });
+    if (!mentionActive) return;
+    if (getMentionQuery() !== requestedFor) return;
+    mentionResults = Array.isArray(res?.results) ? res.results : [];
+    if (mentionSelected >= mentionResults.length) mentionSelected = -1;
+    renderMentionDropdown(requestedFor);
+  }, 180);
 }
 
 // Track @ typing in editor

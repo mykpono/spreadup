@@ -641,259 +641,40 @@
       ?.replace(/^"|"$/g, '') || null;
   }
 
-  // ─── Voyager people search (called by background with csrf token) ─────────────
-  // Pure API call — zero DOM interaction. The content script runs on linkedin.com
-  // so credentials: 'include' sends session cookies automatically.
-
-  async function searchVoyagerApi(query, csrf) {
-    if (!csrf || !query) return [];
-
-    // ── Avatar extractor — handles 4 different LinkedIn image nested shapes ──────
-    function extractAvatar(hit) {
-      try {
-        const attrs = (hit?.image?.attributes) || [];
-        for (const attr of attrs) {
-          // Shape A: detailData keyed by a type URI containing "ImageViewModel"
-          const dd = attr?.detailData || {};
-          const vmKey = Object.keys(dd).find(k => k.includes('ImageViewModel'));
-          if (vmKey) {
-            const vm = dd[vmKey];
-            const art = (vm?.artifacts || [])[0];
-            if (art?.fileIdentifyingUrlPathSegment) {
-              const root = vm.rootUrl || 'https://media.licdn.com/dms/image/';
-              return root + art.fileIdentifyingUrlPathSegment;
-            }
-          }
-          // Shape B: com.linkedin.common.VectorImage at attribute root
-          const vi = attr?.['com.linkedin.common.VectorImage'];
-          if (vi?.rootUrl) {
-            const art = (vi.artifacts || [])[0];
-            return art ? vi.rootUrl + art.fileIdentifyingUrlPathSegment : vi.rootUrl;
-          }
-        }
-        // Shape C: rootUrl directly on image
-        if (hit?.image?.rootUrl) return hit.image.rootUrl;
-      } catch (_) {}
-      return '';
-    }
-
-    // ── Person extractor — called on each raw element or included item ───────────
-    function extractPerson(raw) {
-      // raw may have hitInfo nested 1 or 2 levels deep (TypeaheadHit → SearchProfile)
-      let hit = raw;
-      for (let depth = 0; depth < 2 && hit?.hitInfo; depth++) {
-        const inner = Object.values(hit.hitInfo)[0];
-        hit = (inner && typeof inner === 'object' && (inner.member || inner.entity || inner)) || hit;
-      }
-      if (!hit) return null;
-
-      // Some responses wrap person fields inside a miniProfile sub-object
-      if (!hit.firstName && !hit.lastName && !hit.text && !hit.name && hit.miniProfile) {
-        hit = hit.miniProfile;
-      }
-
-      // Name — stored in different fields across API versions
-      // IMPORTANT: avoid operator-precedence pitfalls, use explicit || chains
-      const nameParts = [
-        hit.text && hit.text.text,
-        hit.title && hit.title.text,
-        hit.name,
-        (hit.firstName || hit.lastName)
-          ? `${hit.firstName || ''} ${hit.lastName || ''}`.trim()
-          : null,
-      ];
-      const name = (nameParts.find(v => v && v.trim()) || '').trim();
-      if (!name || name.length < 2 || name.length > 80) return null;
-
-      const titleParts = [
-        hit.subtext && hit.subtext.text,
-        hit.subtitle && hit.subtitle.text,
-        hit.primarySubtitle && hit.primarySubtitle.text,
-        hit.secondarySubtitle && hit.secondarySubtitle.text,
-        hit.headline,
-        hit.occupation,
-      ];
-      const title = (titleParts.find(v => v && v.trim()) || '').trim();
-      const avatar = extractAvatar(hit);
-
-      return { name, title, avatar };
-    }
-
-    // ── Response parser — handles plain JSON and normalized+json formats ──────────
-    function parseResponse(json) {
-      const people = [];
-
-      // Build a URN → included-item index for normalized+json lookups
-      const includedByUrn = {};
-      if (Array.isArray(json?.included)) {
-        for (const item of json.included) {
-          if (item && typeof item === 'object' && item.entityUrn) {
-            includedByUrn[item.entityUrn] = item;
-          }
-        }
-      }
-
-      // Format 1 (plain JSON / application/json):
-      //   { data: { elements: [...] } } or { elements: [...] }
-      //   or Dash GraphQL: { data: { data: { "com.linkedin.voyager.dash.*": { elements: [...] } } } }
-      //   LinkedIn Dash GraphQL also uses "*elements" (asterisk-prefixed URN list) instead of "elements"
-      const dashNested = json?.data?.data ? Object.values(json.data.data)[0] : null;
-      const rawElements = json?.data?.elements || json?.elements
-        || dashNested?.elements || dashNested?.['*elements'] || [];
-      for (const el of rawElements) {
-        // In normalized format, elements are URN strings — resolve via included index
-        if (typeof el === 'string') {
-          const resolved = includedByUrn[el];
-          if (resolved) {
-            const p = extractPerson(resolved);
-            if (p) people.push(p);
-          }
-          continue;
-        }
-        const p = extractPerson(el);
-        if (p) people.push(p);
-      }
-
-      // Format 2 (normalized+json):
-      //   { included: [ { $type: '...TypeaheadHit', ... } ], data: { elements: ['urn:...'] } }
-      // When elements were all URN strings (or absent), scan included[] directly.
-      if (!people.length && Array.isArray(json?.included)) {
-        for (const item of json.included) {
-          if (!item || typeof item !== 'object') continue;
-          // Skip well-known non-person metadata types; let extractPerson gate the rest
-          const type = (item.$type || item['$type'] || '').toLowerCase();
-          if (type && (type.includes('paging') || type.includes('metadata')
-              || type.includes('config') || type.includes('footer')
-              || type.includes('vectorimage') || type.includes('imageviewmodel')
-              || type.includes('collectionresponse'))) continue;
-          const p = extractPerson(item);
-          if (p) people.push(p);
-        }
-      }
-
-      return people.slice(0, 7);
-    }
-
-    // ── HTTP helper — logs failures, never throws ────────────────────────────────
-    async function fetchTypeahead(url, headers) {
-      try {
-        const res = await fetch(url, { credentials: 'include', headers });
-        if (!res.ok) {
-          console.warn('[SpreadUp] typeahead HTTP', res.status, url.split('?')[0]);
-          return [];
-        }
-        const json = await res.json();
-        // Diagnostic: log raw response shape so we can verify parseResponse handles it
-        console.log('[SpreadUp] typeahead RAW shape:', {
-          topKeys:      Object.keys(json),
-          dataKeys:     json.data     ? Object.keys(json.data)      : [],
-          dataDataKeys: json.data?.data ? Object.keys(json.data.data) : [],
-          elemLen:      json.data?.elements?.length,
-          inclLen:      json.included?.length,
-          firstIncl:    JSON.stringify(json.included?.[0])?.slice(0, 200),
-          firstEl:      JSON.stringify(json.data?.elements?.[0] ?? json.elements?.[0])?.slice(0, 200),
-        });
-        const people = parseResponse(json);
-        console.log('[SpreadUp] typeahead →', people.length, 'results', url.split('queryId=')[1] || url.slice(-40));
-        return people;
-      } catch (err) {
-        console.warn('[SpreadUp] typeahead fetch error:', err.message, url.split('?')[0]);
-        return [];
-      }
-    }
-
-    const baseHeaders = {
-      'csrf-token':                csrf,
-      'x-restli-protocol-version': '2.0.0',
-      'x-li-lang':                 'en_US',
-      'accept-language':           'en-US,en;q=0.9',
-    };
-    const headersJson       = { ...baseHeaders, accept: 'application/json' };
-    const headersNormalized = { ...baseHeaders, accept: 'application/vnd.linkedin.normalized+json+2.1' };
-
-    const kw = encodeURIComponent(query);
-
-    // Attempt 1 — voyagerSearchDashSharing with origin (LinkedIn's current mention endpoint, confirmed 2026)
-    // Uses the same variables structure LinkedIn's own composer sends for @mention autocomplete.
-    let results = await fetchTypeahead(
-      `/voyager/api/graphql?variables=(keywords:${kw},origin:OTHER,count:7,filters:List())&queryId=voyagerSearchDashSharing.4e26d0f2284baec4fa3fe92c090494cd`,
-      headersNormalized,
-    );
-    if (results.length) return results;
-
-    // Attempt 2 — same endpoint, minimal variables (no origin), normalized accept header
-    results = await fetchTypeahead(
-      `/voyager/api/graphql?includeWebMetadata=true&variables=(keywords:${kw})&queryId=voyagerSearchDashSharing.4e26d0f2284baec4fa3fe92c090494cd`,
-      headersNormalized,
-    );
-    if (results.length) return results;
-
-    // Attempt 3 — same endpoint, plain JSON accept header
-    results = await fetchTypeahead(
-      `/voyager/api/graphql?includeWebMetadata=true&variables=(keywords:${kw})&queryId=voyagerSearchDashSharing.4e26d0f2284baec4fa3fe92c090494cd`,
-      headersJson,
-    );
-    if (results.length) return results;
-
-    // Attempt 4 — hitsV2 type=PEOPLE (older endpoint, kept as fallback)
-    results = await fetchTypeahead(
-      `/voyager/api/typeahead/hitsV2?keywords=${kw}&origin=OTHER&q=type&type=PEOPLE`,
-      headersNormalized,
-    );
-    if (results.length) return results;
-
-    // Attempt 5 — hitsV2 blended
-    results = await fetchTypeahead(
-      `/voyager/api/typeahead/hitsV2?keywords=${kw}&q=blended`,
-      headersJson,
-    );
-    if (results.length) return results;
-
-    // Attempt 6 — legacy hits endpoint
-    results = await fetchTypeahead(
-      `/voyager/api/typeahead/hits?keywords=${kw}&q=type&type=PEOPLE&count=7`,
-      headersJson,
-    );
-    if (results.length) return results;
-
-    // Attempt 7 — search/blended with PEOPLE filter
-    results = await fetchTypeahead(
-      `/voyager/api/search/blended?keywords=${kw}&origin=TYPEAHEAD_ESCAPE_HATCH&q=blended&filters=List(resultType-%3EPEOPLE)&count=7`,
-      headersJson,
-    );
-    return results;
-  }
+  // ─── Mention search ────────────────────────────────────────────────────────
+  // Handled entirely in background.js via a direct Voyager GraphQL call to the
+  // voyagerMessagingDashMessagingTypeahead endpoint. No content-script work
+  // needed — see searchLinkedInMentions() in background.js.
 
   // ─── Message handler (from panel via chrome.runtime relay) ───────────────────
 
-  function handleMessage(msg) {
+  function handleMessage(msg, sendResponse) {
     const { type, payload } = msg || {};
-    if (!type) return;
+    if (!type) return false;
 
     switch (type) {
       case 'CLOSE_PANEL':
         hidePanel();
-        break;
+        return false;
       case 'INSERT_TEXT':
         insertTextIntoEditor(getLinkedInEditor(), payload?.text);
-        break;
+        return false;
       case 'GET_EDITOR_TEXT': {
         const editor = getLinkedInEditor();
         chrome.runtime.sendMessage({ type: 'EDITOR_TEXT', text: editor?.innerText || '' });
-        break;
+        return false;
       }
       case 'GET_PROFILE': {
         getLinkedInProfile(payload?.csrf).then(profile => {
           chrome.runtime.sendMessage({ type: 'PROFILE_INFO', ...profile });
         });
-        break;
+        return false;
       }
       case 'PUBLISH_POST':
         handlePublish(payload?.text, payload?.attachments || [], payload?.csrf);
-        break;
-      // SEARCH_LINKEDIN is handled entirely in background.js — no content script involved
+        return false;
       default:
-        break;
+        return false;
     }
   }
 
@@ -909,19 +690,9 @@
     });
 
     // Listen for messages from panel (relayed via background service worker)
-    chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       if (!msg._fromBackground) return;
-
-      // _SEARCH_VOYAGER: async API call — must return true to keep sendResponse alive
-      if (msg.type === '_SEARCH_VOYAGER') {
-        const { query, csrf } = msg.payload || {};
-        searchVoyagerApi(query, csrf)
-          .then((results) => sendResponse({ results }))
-          .catch(() => sendResponse({ results: [] }));
-        return true; // keep channel open for async sendResponse
-      }
-
-      handleMessage(msg);
+      return handleMessage(msg, sendResponse);
     });
 
     // Reconnect to existing panel iframe (e.g. after extension reload)

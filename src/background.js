@@ -220,6 +220,72 @@ FORMATTING RULES:
   return { text: data.content[0]?.text || '' };
 }
 
+// ─── LinkedIn mention typeahead (direct Voyager GraphQL call) ───────────────
+//
+// The queryId hash below was captured from LinkedIn's live messaging composer
+// on 2026-04-21. LinkedIn rotates these hashes every few releases; when
+// searches start returning HTTP 400 the hash needs to be refreshed. To grab a
+// new one: on linkedin.com, type @ in any LinkedIn composer or messaging box
+// and copy the voyagerMessagingDashMessagingTypeahead.<hash> from the Network
+// tab of DevTools.
+
+const MENTION_QUERY_ID = 'voyagerMessagingDashMessagingTypeahead.7f566173ac0c94b510b3dc2b2a6763d4';
+
+async function searchLinkedInMentions(query) {
+  if (!query || !query.trim()) return { results: [] };
+
+  const csrf = await getLinkedInCsrf();
+  if (!csrf) return { results: [], error: 'no_csrf' };
+
+  // LinkedIn's GraphQL expects rest.li-encoded variables: parentheses group,
+  // colons separate key/value, List(...) for arrays. encodeURIComponent the
+  // keyword so @ and other reserved chars survive.
+  const keyword = encodeURIComponent(query.trim());
+  const url = `https://www.linkedin.com/voyager/api/graphql`
+    + `?variables=(keyword:${keyword},types:List(CONNECTIONS))`
+    + `&queryId=${MENTION_QUERY_ID}`;
+
+  try {
+    const res = await fetch(url, {
+      credentials: 'include',
+      headers: {
+        'csrf-token':                csrf,
+        'x-restli-protocol-version': '2.0.0',
+        'accept':                    'application/vnd.linkedin.normalized+json+2.1',
+      },
+    });
+    if (!res.ok) return { results: [], error: `http_${res.status}` };
+    const data = await res.json();
+
+    const elements =
+      data?.data?.data?.messagingDashMessagingTypeaheadByTypeaheadKeyword?.elements
+      || data?.data?.messagingDashMessagingTypeaheadByTypeaheadKeyword?.elements
+      || [];
+
+    const results = elements.map((el) => {
+      const tvm = el?.targetEntityViewModel;
+      // Titles come back like "Andy Kurtzig • 1st" — strip the degree suffix.
+      const rawTitle = tvm?.title?.text || '';
+      const name = rawTitle.replace(/\s*•\s*\d+(?:st|nd|rd|th)?\s*$/i, '').trim();
+      const title = tvm?.subtitle?.text || '';
+
+      let avatar = null;
+      const vm = tvm?.image?.attributes?.[0]?.detailData?.nonEntityProfilePicture?.vectorImage;
+      if (vm?.rootUrl && Array.isArray(vm.artifacts) && vm.artifacts.length) {
+        // Smallest artifact is plenty for a 28px avatar.
+        const art = vm.artifacts[0];
+        avatar = vm.rootUrl + (art.fileIdentifyingUrlPathSegment || '');
+      }
+
+      return name ? { name, title, avatar } : null;
+    }).filter(Boolean).slice(0, 8);
+
+    return { results };
+  } catch (err) {
+    return { results: [], error: err.message || 'fetch_failed' };
+  }
+}
+
 // ─── Open Graph metadata fetch ───────────────────────────────────────────────
 
 async function fetchOgMeta(url) {
@@ -250,11 +316,10 @@ async function fetchOgMeta(url) {
   }
 }
 
-// ─── LinkedIn people search — entirely in background, zero DOM touching ──────
-// Reads LinkedIn cookies (including httpOnly) via chrome.cookies API, then calls
-// the Voyager typeahead endpoint directly from the service worker. Results are
-// broadcast to the panel via chrome.runtime.sendMessage — the content script is
-// never involved in the search flow.
+// ─── LinkedIn CSRF (httpOnly JSESSIONID) ─────────────────────────────────────
+// Used by forwardToContentScript to inject the csrf token into PUBLISH_POST
+// and GET_PROFILE payloads. Content scripts can't read httpOnly cookies, so
+// the service worker has to read it via chrome.cookies.
 
 async function getLinkedInCsrf() {
   // Use getAll+domain so we match cookies regardless of path, subdomain, or
@@ -274,47 +339,6 @@ async function getLinkedInTab() {
   if (tabs.length) return tabs[0];
   tabs = await chrome.tabs.query({ url: 'https://www.linkedin.com/*' });
   return tabs[0] || null;
-}
-
-async function searchLinkedInPeople(query) {
-  const empty = { type: 'LINKEDIN_SEARCH_RESULTS', results: [], query };
-  if (!query) return empty;
-
-  try {
-    // 1. Read httpOnly JSESSIONID via chrome.cookies (content scripts can't read it)
-    const csrf = await getLinkedInCsrf();
-    if (!csrf) {
-      console.warn('[SpreadUp] @mention search: no JSESSIONID cookie found — is the user logged into LinkedIn?');
-      return empty;
-    }
-    console.log('[SpreadUp] @mention search: csrf token found, querying content script for:', query);
-
-    // 2. Forward to content script WITH the csrf token.
-    //    Content script runs on linkedin.com so credentials: 'include' sends
-    //    session cookies automatically — no Cookie header needed (forbidden by CORS).
-    const tab = await getLinkedInTab();
-    if (!tab) {
-      console.warn('[SpreadUp] @mention search: no LinkedIn tab found');
-      return empty;
-    }
-
-    const response = await chrome.tabs.sendMessage(tab.id, {
-      type: '_SEARCH_VOYAGER',
-      payload: { query, csrf },
-      _fromBackground: true,
-    });
-
-    const results = response?.results || [];
-    console.log('[SpreadUp] @mention search: got', results.length, 'results for', query);
-    return {
-      type: 'LINKEDIN_SEARCH_RESULTS',
-      results,
-      query,
-    };
-  } catch (err) {
-    console.warn('[SpreadUp] @mention search error:', err.message || err);
-    return empty;
-  }
 }
 
 // ─── Forward messages to the active LinkedIn tab's content script ────────────
@@ -353,10 +377,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case 'INCREMENT_POST_COUNT': return incrementPostCount();
       case 'SMART_FORMAT':  return smartFormatWithAI(msg.payload?.text || '');
       case 'FETCH_OG':         return fetchOgMeta(msg.payload?.url || '');
-
-      // @mention search — handled entirely in background (reads httpOnly cookie)
-      case 'SEARCH_LINKEDIN':
-        return searchLinkedInPeople(msg.payload?.query || '');
+      case 'SEARCH_LINKEDIN': return searchLinkedInMentions(msg.payload?.query || '');
 
       // Panel → Background → Content Script (forwarded)
       case 'PUBLISH_POST':
@@ -366,7 +387,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
       // Content Script → Background → Panel (broadcast to all extension pages)
       // These are no-ops here; the panel receives them via chrome.runtime.onMessage
-      case 'LINKEDIN_SEARCH_RESULTS':
       case 'PUBLISH_SUCCESS':
       case 'PUBLISH_NEED_MANUAL':
       case 'PUBLISH_COPY_FALLBACK':
